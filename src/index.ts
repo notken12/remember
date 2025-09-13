@@ -19,14 +19,37 @@ class MyMentraOSApp extends AppServer {
 
     session.events.onButtonPress(async (e) => {
       session.logger.info(`Button pressed: ${e.buttonId}`)
-      const photo = await session.camera.requestPhoto({ saveToGallery: false })
-      session.logger.info(`Photo taken: ${photo.filename} ${photo.buffer.length} bytes ${photo.timestamp}`)
-      const { data, error } = await supabase.storage.from("memories").upload(photo.filename, photo.buffer, { contentType: photo.mimeType })
-      if (error) {
-        session.logger.error(`Error uploading photo: ${error.message}`)
-      } else {
-        session.logger.info(`Photo uploaded: ${data.path}`)
+
+      // const photo = await session.camera.requestPhoto({ saveToGallery: false })
+      // session.logger.info(`Photo taken: ${photo.filename} ${photo.buffer.length} bytes ${photo.timestamp}`)
+      // const { data, error } = await supabase.storage.from("memories").upload(photo.filename, photo.buffer, { contentType: photo.mimeType })
+      // if (error) {
+      //   session.logger.error(`Error uploading photo: ${error.message}`)
+      // } else {
+      //   session.logger.info(`Photo uploaded: ${data.path}`)
+      // }
+      //
+      //
+
+      const { hasActiveStream } = await session.camera.checkExistingStream()
+      if (hasActiveStream) {
+        await session.camera.stopManagedStream()
+        return
       }
+
+      const urls = await session.camera.startManagedStream({ enableWebRTC: true, stream: { durationLimit: 1800 } })
+      const { previewUrl, dashUrl, hlsUrl, webrtcUrl, streamId, thumbnailUrl } = urls
+      session.logger.info(`Managed stream started: ${JSON.stringify(urls)}`)
+
+
+      // await session.camera.startStream({
+      //   rtmpUrl: "rtmp://localhost/live/livestream"
+      // })
+      // session.logger.info(`Stream started`)
+    })
+
+    const statusUnsubscribe = session.camera.onManagedStreamStatus((data) => {
+      session.logger.info(`Managed stream status: ${JSON.stringify(data, null, 2)}`)
     })
 
     const photoInterval = setInterval(async () => {
@@ -37,6 +60,7 @@ class MyMentraOSApp extends AppServer {
     session.events.onDisconnected(() => {
       session.logger.info(`Session ${sessionId} disconnected.`)
       clearInterval(photoInterval)
+      statusUnsubscribe()
     })
   }
 }
