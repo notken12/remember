@@ -1,0 +1,23 @@
+{
+  "name": "remember",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "bun run dist/index.js",
+    "dev": "bun --watch src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^24.3.3",
+    "tsx": "^4.20.5"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@mentra/sdk": "^2.1.22",
+    "@supabase/supabase-js": "^2.57.4"
+  }
+}
