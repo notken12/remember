@@ -8,12 +8,63 @@ import {
     SelectTrigger,
     SelectValue,
 } from "@/components/ui/select";
+
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
+import { cn } from '@/lib/utils';
 
 export default function DemoPage() {
+    const sse = useRef<EventSource | undefined>(undefined)
+    const [messages, setMesages] = useState<UIMessage[]>([])
+
+    useEffect(() => {
+        sse.current = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
+        if (!sse.current) return
+        (async () => {
+            const stream = new ReadableStream<UIMessageChunk>({
+                start(controller) {
+                    sse.current.onmessage = (event) => {
+                        controller.enqueue(event.data);
+                    };
+
+                    sse.current.onerror = (error) => {
+                        controller.error(error);
+                    };
+
+                    sse.current.onopen = () => {
+                        console.log('SSE connection opened');
+                    };
+                },
+                cancel() {
+                    sse.current.close();
+                }
+            });
+            for await (const uiMessage of readUIMessageStream({
+                stream
+            })) {
+                console.log(uiMessage)
+            }
+        })();
+    }, [])
     return (
         <div className="absolute inset-0">
             <WebcamBackground />
+            <ol>
+                {messages.map((msg) => {
+                    return (
+                        <li key={msg.id} className={cn({ "bg-primary text-primary-foreground": msg.role === "user" })}>
+                            {msg.parts.map((part) => {
+                                switch (part.type) {
+                                    case "text":
+                                        return <p>{part.text}</p>
+                                    default:
+                                        return <div>{JSON.stringify(part)}</div>
+                                }
+                            })}
+                        </li>
+                    )
+                })}
+            </ol>
         </div>
     )
 }
