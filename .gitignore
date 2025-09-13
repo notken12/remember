@@ -35,3 +35,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # cat video
 src/videos/cat.mp4
+
+# pycache
+__pycache__

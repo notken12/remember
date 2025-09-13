@@ -103,7 +103,7 @@ class VideoClip:
                 if video_file.state.name == "FAILED":
                     raise Exception("Video processing failed")
                 
-                model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+                model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
                 
                 # Craft a concise but detailed prompt for memory assistance
                 prompt = """
@@ -181,7 +181,7 @@ class VideoClip:
             print(f"✅ Video fetched successfully ({len(video_data)} bytes)")
             
             # Step 2: Generate annotation with Gemini
-            print("🤖 Generating annotation with Gemini 2.0 Flash...")
+            print("🤖 Generating annotation with Gemini 2.5 Flash Lite...")
             self.annotation = self._generate_annotation_with_gemini(video_data)
             print("✅ Annotation generated successfully")
             
@@ -200,24 +200,6 @@ class VideoClip:
             print(f"❌ Error during annotation process: {str(e)}")
             return False
     
-    def get_annotation(self) -> str:
-        """
-        Get the current annotation for this video.
-        
-        Returns:
-            str: The annotation text
-        """
-        return self.annotation
-    
-    def __str__(self) -> str:
-        """String representation of the VideoClip."""
-        return f"VideoClip(id={self.id}, annotation_length={len(self.annotation)})"
-    
-    def __repr__(self) -> str:
-        """Detailed string representation of the VideoClip."""
-        return f"VideoClip(id='{self.id}', annotation='{self.annotation[:50]}...' if len(self.annotation) > 50 else annotation='{self.annotation}')"
-
-
 def main():
     """
     Example usage of the VideoClip class.
@@ -242,7 +224,6 @@ def main():
     print("  clip = VideoClip('your-video-uuid')")
     print("  clip.annotate()")
     print("  print(clip.get_annotation())")
-
 
 if __name__ == "__main__":
     main()
