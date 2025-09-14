@@ -11,7 +11,7 @@ interface Video {
 }
 
 export default async function AgentPage() {
-    const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_API_KEY!)
+    const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_API_KEY!)
     const { data } = await supabase.from('videos').select('*').throwOnError();
     const videos: Video[] = data.map(v => {
         return {

@@ -62,7 +62,7 @@ async def esi_chat(session_id: str, user_message: str):
 
 
 @app.post("/assistant_chat")
-async def assistant_chat(user_message: str):
+async def assistant_chat(session_id: str, user_message: str):
     assistant_agent = AssistantAgent()
 
     async def generator():
@@ -70,7 +70,7 @@ async def assistant_chat(user_message: str):
         r.publish("web_stream", start_part)
         yield ServerSentEvent(data=start_part)
 
-        async for part in assistant_agent.query(user_message):
+        async for part in assistant_agent.query(user_message, session_id):
             r.publish("web_stream", part.model_dump_json())
             yield ServerSentEvent(data=part.model_dump_json())
         finish_part = FinishMessagePart()
