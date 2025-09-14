@@ -16,11 +16,11 @@ class State(TypedDict):
 def json_to_message(json: dict):
     message_type = json.get("type")
     if message_type == "human":
-        return HumanMessage(content=json["content"], **json)
+        return HumanMessage(**json)
     elif message_type == "ai":
-        return AIMessage(content=json["content"], **json)
+        return AIMessage(**json)
     elif message_type == "tool":
-        return ToolMessage(content=json["content"], **json)
+        return ToolMessage(**json)
     else:
         raise ValueError(f"Unknown message type: {message_type}. Message: {json}")
 
