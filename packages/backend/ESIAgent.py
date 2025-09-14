@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import sys
 
-import google.generativeai as genai
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from VideoClip import VideoClip
@@ -58,7 +57,6 @@ class ESIAgent:
             raise ValueError("GEMINI_API_KEY is required")
 
         self.supabase: Client = create_client(self.supabase_url, self.supabase_service_role_key)
-        genai.configure(api_key=self.gemini_api_key)
         # Keep selected memories and prepared video handles for downstream use
         self.memories_context: List[Dict[str, Any]] = []
         self.video_files_context: List[Any] = []
@@ -183,20 +181,16 @@ class ESIAgent:
             return []
 
         prompt = self._build_esi_instruction(candidates, max_items=max_items)
-        model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config={
-                "response_mime_type": "application/json",
-            },
-        )
-
-        response = model.generate_content(prompt)
-        text = getattr(response, "text", None) or getattr(response, "candidates", None)
-        if isinstance(text, list):
-            # Fallback if SDK returns structured candidates; stringify conservatively
-            text = "".join([getattr(c, "content", "") for c in text])
-        if not isinstance(text, str):
-            raise RuntimeError("Model did not return text content")
+        if ChatGoogleGenerativeAI is None or SystemMessage is None:
+            raise RuntimeError("LangChain Google GenAI dependencies are not available. Install langchain-google-genai.")
+        if self.llm is None:
+            raise RuntimeError("LLM not initialized")
+        system_msg = SystemMessage(content=(
+            "Return ONLY JSON: an array of {\"uuid\": string, \"reasoning\": string}. No extra text."
+        ))
+        human_msg = HumanMessage(content=prompt)
+        ai_response = self.llm.invoke([system_msg, human_msg])
+        text = getattr(ai_response, "content", "")
 
         try:
             parsed = json.loads(text)
@@ -262,7 +256,6 @@ class ESIAgent:
         return selected
 
     def _prepare_video_context_with_videoclips(self, uuids: Sequence[str]) -> None:
-        uploaded: List[Any] = []
         lc_parts: List[Dict[str, Any]] = []
         try:
             print(f"⬆️ Uploading {len(list(uuids))} videos to Gemini...")
@@ -271,25 +264,13 @@ class ESIAgent:
         for uuid_val in uuids:
             try:
                 clip = VideoClip(uuid_val)
-                # Prepare Gemini file for non-LangChain direct calls (kept for compatibility)
-                tmp_path = clip.download_to_tempfile()
+                media_part, temp_path = clip.make_langchain_media_part()
+                lc_parts.append(media_part)
                 try:
-                    file_handle = clip.upload_to_gemini(tmp_path)
-                    uploaded.append(file_handle)
-                finally:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-                    except Exception:
-                        pass
-                # Prepare LangChain media part using uploaded file URI/name
-                file_uri = getattr(file_handle, "uri", None) or getattr(file_handle, "name", None)
-                if file_uri:
-                    lc_parts.append({
-                        "type": "media",
-                        "mime_type": "video/mp4",
-                        "file_uri": file_uri,
-                    })
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except Exception:
+                    pass
                 try:
                     print(f"   ✅ Prepared media part for {uuid_val}")
                 except Exception:
@@ -301,7 +282,7 @@ class ESIAgent:
                 except Exception:
                     pass
                 continue
-        self.video_files_context = uploaded
+        self.video_files_context = []
         # Replace any previous cache
         # Note: temp paths will be cleaned after chat loop ends or on agent reinit
         self._langchain_media_parts = lc_parts

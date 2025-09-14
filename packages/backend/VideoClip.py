@@ -3,9 +3,10 @@
 import os
 import tempfile
 from uuid import UUID
-import google.generativeai as genai
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
 
 # Load environment variables
 load_dotenv()
@@ -34,11 +35,10 @@ class VideoClip:
         self.supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         self.supabase: Client = create_client(self.supabase_url, self.supabase_service_role_key)
         
-        # Initialize Gemini client
+        # Ensure Gemini API key exists for LangChain
         gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required")
-        genai.configure(api_key=gemini_api_key)
         
     def _fetch_video_from_supabase(self) -> bytes:
         """
@@ -98,26 +98,7 @@ class VideoClip:
             print(f"💾 [VideoClip:{self.id}] Saved temp file: {temp_file.name}")
             return temp_file.name
 
-    def upload_to_gemini(self, local_path: str):
-        """
-        Upload a local video file to Gemini and wait until processing completes.
-        Returns the uploaded file handle usable as a multimodal part.
-        """
-        print(f"🚀 [VideoClip:{self.id}] Uploading to Gemini: {local_path}")
-        video_file = genai.upload_file(path=local_path, mime_type="video/mp4")
-        import time
-        while getattr(video_file, 'state', None) and getattr(video_file.state, 'name', '') == "PROCESSING":
-            print("⏳ [VideoClip] Gemini processing...")
-            time.sleep(2)
-            video_file = genai.get_file(video_file.name)
-        if getattr(video_file, 'state', None) and getattr(video_file.state, 'name', '') == "FAILED":
-            raise Exception("Video processing failed")
-        try:
-            uri = getattr(video_file, 'uri', None) or getattr(video_file, 'name', None)
-            print(f"✅ [VideoClip:{self.id}] Gemini upload ready: {uri}")
-        except Exception:
-            pass
-        return video_file
+    
 
     def make_langchain_media_part(self) -> tuple:
         """
@@ -136,9 +117,9 @@ class VideoClip:
         }
         return media_part, temp_path
     
-    def _generate_annotation_with_gemini(self, video_data: bytes) -> str:
+    def _generate_annotation_with_langchain(self, video_data: bytes) -> str:
         """
-        Generate annotation for the video using Gemini 2.0 Flash.
+        Generate annotation for the video using LangChain + Gemini chat model.
         
         Args:
             video_data (bytes): Video file data
@@ -150,41 +131,27 @@ class VideoClip:
             Exception: If annotation generation fails
         """
         try:
-            # Create a temporary file to store the video
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
-                temp_file.write(video_data)
-                temp_video_path = temp_file.name
-            
-            try:
-                # Upload the video file to Gemini (reusing upload utility)
-                video_file = self.upload_to_gemini(temp_video_path)
+            gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+            if not gemini_api_key:
+                raise ValueError("GEMINI_API_KEY environment variable is required")
+            llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key=gemini_api_key)
 
-                model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
-                
-                # Craft a concise but detailed prompt for memory assistance
-                prompt = """
-                Create a brief but vivid annotation of this smart glasses video for memory recall assistance. Focus on sensory details and atmosphere in 2-3 short paragraphs maximum.
-                
-                Include: Visual details (people, objects, colors, lighting), audio (music, voices, sounds), emotional atmosphere, and key interactions. Be specific about memorable elements that serve as memory anchors.
-                
-                Write in present tense, no introductory phrases, no formatting headers. Start directly with the scene description.
-                """
-                
-                # Generate the annotation
-                response = model.generate_content([video_file, prompt])
-                
-                # Clean up the temporary file
-                os.unlink(temp_video_path)
-                
-                return response.text
-                
-            finally:
-                # Ensure temporary file is cleaned up even if an error occurs
-                if os.path.exists(temp_video_path):
-                    os.unlink(temp_video_path)
-                    
+            prompt = (
+                "Create a brief but vivid annotation of this smart glasses video for memory recall assistance. "
+                "Focus on sensory details and atmosphere in 2-3 short paragraphs maximum.\n\n"
+                "Include: Visual details (people, objects, colors, lighting), audio (music, voices, sounds), "
+                "emotional atmosphere, and key interactions. Be specific about memorable elements that serve as memory anchors.\n\n"
+                "Write in present tense, no introductory phrases, no formatting headers. Start directly with the scene description."
+            )
+
+            user_content = [
+                {"type": "media", "mime_type": "video/mp4", "data": video_data},
+                {"type": "text", "text": prompt},
+            ]
+            ai = llm.invoke([HumanMessage(content=user_content)])
+            return getattr(ai, "content", "")
         except Exception as e:
-            raise Exception(f"Error generating annotation with Gemini: {str(e)}")
+            raise Exception(f"Error generating annotation with LangChain: {str(e)}")
     
     def _update_annotation_in_supabase(self, annotation: str) -> bool:
         """
@@ -237,12 +204,11 @@ class VideoClip:
             print(f"✅ Video downloaded successfully to {temp_video_path}")
             
             # Step 2: Generate annotation with Gemini
-            print("🤖 Generating annotation with Gemini 2.5 Flash Lite...")
+            print("🤖 Generating annotation with LangChain (Gemini 2.5 Flash Lite)...")
             try:
-                # Read bytes to reuse existing annotation generator
                 with open(temp_video_path, 'rb') as f:
                     video_bytes = f.read()
-                self.annotation = self._generate_annotation_with_gemini(video_bytes)
+                self.annotation = self._generate_annotation_with_langchain(video_bytes)
             finally:
                 try:
                     if os.path.exists(temp_video_path):
