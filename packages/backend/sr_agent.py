@@ -6,6 +6,14 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple
 
 from dotenv import load_dotenv
+from SRQuestionGenerator import QuestionGenerator
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from postgres import AsyncPostgresSaver
+from parsing import parse_langgraph_stream
+from protocol import StreamProtocolPart
+import uuid
 from supabase import Client, create_client
 
 from VideoClip import VideoClip
@@ -440,16 +448,239 @@ def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = N
     sr["active_session"] = None
 
 
+# ---------------------------------------------------------------------
+# Runner (LangGraph agent) - mirrors esi_agent.py
+# ---------------------------------------------------------------------
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are a supportive spaced-retrieval (SR) memory coach. "
+        "Ask one specific, concrete recall question at a time, grounded in the current clip. "
+        "Prefer sensory details and simple where/when anchors. Keep replies short and encouraging."
+    )
+
+
+class SRAgentRunner:
+    def __init__(self, session_id: Optional[str] = None):
+        self.database_url = os.getenv("DATABASE_URL", "")
+        if not self.database_url:
+            raise ValueError("DATABASE_URL is required")
+
+        self.session_id = session_id or f"sr_session_{datetime.now().isoformat()}"
+        self.config = {"configurable": {"thread_id": self.session_id}}
+
+        # Initialize single checkpointer and agent (like esi_agent.py)
+        self._checkpointer = None
+        self._agent = None
+        self._initialize_agent()
+
+    def _initialize_agent(self):
+        if self._checkpointer is None:
+            from psycopg import Connection
+            from psycopg.rows import dict_row
+
+            conn = Connection.connect(
+                self.database_url,
+                autocommit=True,
+                prepare_threshold=0,
+                row_factory=dict_row,
+                connect_timeout=30,
+                options="-c statement_timeout=300000",
+            )
+            self._checkpointer = AsyncPostgresSaver(conn, None)
+            self._checkpointer._conn_string = self.database_url
+
+            self._agent = create_react_agent(
+                model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
+                tools=[],
+                checkpointer=self._checkpointer,
+            )
+
+    def __del__(self):
+        if self._checkpointer and hasattr(self._checkpointer, "conn"):
+            try:
+                self._checkpointer.conn.close()
+            except Exception:
+                pass
+
+    def _get_state(self) -> Dict[str, Any]:
+        snapshot = self._agent.get_state(self.config)
+        state = snapshot.values
+        if "sr" not in state or not isinstance(state.get("sr"), dict):
+            state["sr"] = {}
+        return state
+
+    async def kickoff(self) -> "async_generator[StreamProtocolPart, None]":
+        state = self._get_state()
+        # Initialize config/defaults on sr slice
+        configure_sr_from_env(state)
+
+        # Discover and select
+        candidates = load_recent_video_ids(state)
+        sr = ensure_sr_slice(state)
+        selected = select_first_n(candidates, n=3)
+        sr["selected_clips"] = list(selected)
+        sr["enqueued_clips"] = []
+
+        # Prepare questions and enqueue
+        qpc = int(sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP))
+        now = datetime.utcnow()
+        for cid in selected:
+            try:
+                # Generate questions
+                qgen = QuestionGenerator(VideoClip(cid))
+                questions_objs = qgen.generate(num_questions=qpc) or []
+                questions: List[QuestionState] = [
+                    {"text_cue": str(q.text_cue), "answer": str(q.answer)} for q in questions_objs
+                ]
+                if not questions:
+                    continue
+                # Cache
+                cq = sr.get("clip_questions", {}) or {}
+                cq[cid] = questions
+                sr["clip_questions"] = cq
+                # Enqueue
+                enqueue(state, clip_id=cid, questions=questions, interval_index=0, base_time=now, attempt_count=0)
+                sr["enqueued_clips"].append(cid)
+            except Exception:
+                continue
+
+        # If an item is due now, start session and attach media
+        first_prompt: Optional[str] = None
+        media_parts: List[MediaPart] = []
+        due = get_next_due(state, now=now)
+        if due is not None:
+            item = pop_next_due(state, now=now)
+            if item is not None:
+                first_prompt = begin_session(state, item)
+                clip_id = item.get("clip_id", "")
+                media_parts = prepare_video_context([clip_id]) if clip_id else []
+
+        # Build streaming payload
+        system_prompt = _build_system_prompt()
+        if first_prompt:
+            human_content: List[Any] = [
+                {"type": "text", "text": f"Greet briefly and ask exactly this question: {first_prompt}"},
+                *media_parts,
+            ]
+        else:
+            n = len(sr.get("enqueued_clips", []))
+            human_content = [
+                {"type": "text", "text": f"We will practice recall for {n} short clips. Greet briefly and ask if they are ready to begin."},
+            ]
+
+        async for part in parse_langgraph_stream(
+            self._agent.astream(
+                {
+                    "messages": [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=human_content),
+                    ]
+                },
+                config=self.config,
+                stream_mode="messages",
+            )
+        ):
+            yield part
+
+    async def chat(self, user_message: str) -> "async_generator[StreamProtocolPart, None]":
+        state = self._get_state()
+        sr = ensure_sr_slice(state)
+        sr["last_activity_at"] = _to_iso(datetime.utcnow())
+
+        # If session active: record answer and determine next step
+        sess = sr.get("active_session")
+        human_content: List[Any]
+        if isinstance(sess, dict):
+            append_answer_and_advance(state, user_message)
+            if not session_finished(state):
+                prompt = current_prompt(state) or "Notice one concrete detail you remember from this clip."
+                clip_id = str(sess.get("clip_id", ""))
+                media_parts = prepare_video_context([clip_id]) if clip_id else []
+                human_content = [
+                    {"type": "text", "text": f"Thank them and ask exactly this next question: {prompt}"},
+                    *media_parts,
+                ]
+            else:
+                result = evaluate_session(state)
+                reschedule(state, success=bool(result.get("success", False)), now=datetime.utcnow())
+                human_content = [
+                    {"type": "text", "text": "Nice job. Let them know we will circle back to this clip later based on how it went."},
+                ]
+        else:
+            # No active session; if due, start; else small talk
+            now = datetime.utcnow()
+            due = get_next_due(state, now=now)
+            if due is not None:
+                item = pop_next_due(state, now=now)
+                if item is not None:
+                    prompt = begin_session(state, item)
+                    clip_id = item.get("clip_id", "")
+                    media_parts = prepare_video_context([clip_id]) if clip_id else []
+                    human_content = [
+                        {"type": "text", "text": f"Begin the next session and ask exactly this: {prompt}"},
+                        *media_parts,
+                    ]
+                else:
+                    human_content = [
+                        {"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."},
+                    ]
+            else:
+                # Small talk / waiting
+                user_text_norm = (user_message or "").strip().lower()
+                if user_text_norm in {"begin", "start", "next", "go", "ready"}:
+                    msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
+                else:
+                    msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
+                human_content = [{"type": "text", "text": msg}]
+
+        system_prompt = _build_system_prompt()
+        async for part in parse_langgraph_stream(
+            self._agent.astream(
+                {
+                    "messages": [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=human_content),
+                    ]
+                },
+                config=self.config,
+                stream_mode="messages",
+            )
+        ):
+            yield part
+
+
 async def main():
-    """Placeholder CLI for SR runner (will be expanded in subsequent phases)."""
+    """CLI for SR Agent runner (kickoff/chat/interactive)."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="SR Agent (scaffold)")
+    parser = argparse.ArgumentParser(description="SR Agent with LangGraph")
     parser.add_argument("--session-id", help="Session ID for conversation persistence")
+    parser.add_argument("--chat", help="Single message to send")
+    parser.add_argument("--interactive", action="store_true", default=True, help="Interactive chat mode")
     args = parser.parse_args()
 
-    session_id = args.session_id or "sr_session"
-    print(f"SR Agent scaffold ready. Session ID: {session_id}")
+    session_id = args.session_id or str(uuid.uuid4())
+    runner = SRAgentRunner(session_id=session_id)
+    print(f"Session ID: {session_id}")
+
+    if args.chat:
+        async for part in runner.chat(args.chat):
+            print("Coach:", part)
+    elif args.interactive:
+        print("Starting SR session...")
+        try:
+            async for part in runner.kickoff():
+                print("Coach:", part)
+            while True:
+                user_input = input("You: ").strip()
+                if not user_input:
+                    continue
+                async for part in runner.chat(user_input):
+                    print("Coach:", part)
+        except KeyboardInterrupt:
+            print("\nSession ended. Your conversation is saved.")
 
 
 if __name__ == "__main__":
