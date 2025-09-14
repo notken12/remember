@@ -123,6 +123,11 @@ class SRState(TypedDict, total=False):
     active_session: Optional[ActiveSessionState]
     last_activity_at: str
     errors: List[str]
+    # New fields for stage-aware orchestration
+    stage: Literal["kickoff", "session_active", "feedback_next", "waiting", "idle"]
+    last_stage_change_at: str
+    media_attached_clips: List[str]
+    pending_eval_q_index: Optional[int]
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -165,8 +170,33 @@ def ensure_sr_slice(state: Dict[str, Any]) -> SRState:
         sr["active_session"] = None
     if not isinstance(sr.get("errors"), list):
         sr["errors"] = []
+    # Initialize new stage-related fields
+    if sr.get("stage") not in {"kickoff", "session_active", "feedback_next", "waiting", "idle"}:
+        sr["stage"] = "idle"
+    if not isinstance(sr.get("last_stage_change_at"), str):
+        sr["last_stage_change_at"] = _to_iso(datetime.utcnow())
+    if not isinstance(sr.get("media_attached_clips"), list):
+        sr["media_attached_clips"] = []
+    if "pending_eval_q_index" not in sr:
+        sr["pending_eval_q_index"] = None
 
     return sr
+
+
+def get_stage(state: Dict[str, Any]) -> str:
+    sr = ensure_sr_slice(state)
+    return str(sr.get("stage", "idle"))
+
+
+def set_stage(state: Dict[str, Any], stage: str) -> bool:
+    """Set stage if changed; update last_stage_change_at. Returns True if changed."""
+    sr = ensure_sr_slice(state)
+    current = str(sr.get("stage", "idle"))
+    if current == stage:
+        return False
+    sr["stage"] = stage
+    sr["last_stage_change_at"] = _to_iso(datetime.utcnow())
+    return True
 
 
 def _parse_int_list_env(var_name: str, fallback: List[int]) -> List[int]:
