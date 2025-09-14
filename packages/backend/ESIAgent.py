@@ -22,7 +22,8 @@ from ChatMessage import ChatMessage  # type: ignore
 
 # LangChain - Gemini chat model
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.tools import tool
 
 load_dotenv()
 
@@ -48,7 +49,7 @@ class ESIAgent:
         
         self.gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
         self.model_name: str = "gemini-2.5-flash"
-        self.table_name: str = "test_videos"
+        self.table_name: str = "videos"
         # Default to created_at but permit override via CLI; keep legacy compat
         self.timestamp_column: str = "time_created"
         # Context mode: "video" | "annotation"
@@ -64,6 +65,10 @@ class ESIAgent:
         self.video_files_context: List[Any] = []
         # LangChain media parts cache for selected videos
         self._langchain_media_parts: List[Dict[str, Any]] = []
+        # Map selected clip UUID -> Gemini file URI (for model context and tool calls)
+        self._uuid_to_file_uri: Dict[str, str] = {}
+        # Tool-enabled LLM wrapper
+        self._llm_with_tools = None  # type: ignore
 
         # Initialize chat session (persistent memory)
         self.session: Optional["ChatSession"] = session
@@ -84,6 +89,12 @@ class ESIAgent:
                 model=self.model_name,
                 google_api_key=self.gemini_api_key,
             )
+        # Initialize tools for video display requests
+        try:
+            self._init_tools()
+        except Exception:
+            # Tooling is optional; proceed without if initialization fails
+            pass
 
     def fetch_annotated_videos(
         self,
@@ -285,6 +296,8 @@ Here are the candidate clips (JSON):
                 # Prepare LangChain media part using uploaded file URI/name
                 file_uri = getattr(file_handle, "uri", None) or getattr(file_handle, "name", None)
                 if file_uri:
+                    # Track mapping for use in prompts and tool validation
+                    self._uuid_to_file_uri[str(uuid_val)] = str(file_uri)
                     lc_parts.append({
                         "type": "media",
                         "mime_type": "video/mp4",
@@ -337,7 +350,62 @@ Here are the candidate clips (JSON):
             "- Prefer simple, concrete language.\n"
             "- If memory is vague, offer options (e.g., sights, sounds, people) and let the patient choose.\n"
             "- If stuck, suggest a tiny step (notice lighting, a color, a voice).\n"
+            "\nTooling:\n"
+            "- When you want the UI to show a specific moment from a clip, call the tool `display_video_segment` with {uuid, start_seconds, end_seconds}. Use one of the available uuids provided with the attached clips.\n"
         )
+
+    def _build_available_clips_text(self) -> str:
+        """
+        Summarize available clips so the model can reference uuids alongside media.
+        """
+        if not self._uuid_to_file_uri:
+            return "Available clips: (not available)"
+        lines: List[str] = ["Available clips (uuid -> file_uri):"]
+        for uuid_val, uri in self._uuid_to_file_uri.items():
+            # Try to include annotation if present in memories_context
+            ann = ""
+            try:
+                for m in self.memories_context:
+                    if str(m.get("uuid")) == str(uuid_val):
+                        if m.get("annotation"):
+                            ann = f" annotation: {str(m.get('annotation'))[:120]}"
+                        break
+            except Exception:
+                pass
+            lines.append(f"- {uuid_val} -> {uri}{ann}")
+        return "\n".join(lines)
+
+    def _init_tools(self) -> None:
+        """
+        Define and bind tools the model can call. Also keep a reference to the tool-enabled LLM.
+        """
+        if self.llm is None:
+            return
+
+        # Define the tool for requesting video playback in the UI
+        @tool("display_video_segment")
+        def _display_video_segment(uuid: str, start_seconds: float, end_seconds: float) -> str:
+            """Request the UI to display a segment of a selected clip. Provide a clip UUID available in context, and start/end seconds as numbers (start <= end)."""
+            # This body may not execute automatically unless used with an agent loop. We also handle persistence after model invoke.
+            try:
+                # Validate and persist a best-effort tool intent message
+                payload: Dict[str, Any] = {
+                    "tool": "display_video_segment",
+                    "uuid": str(uuid),
+                    "start_seconds": float(start_seconds),
+                    "end_seconds": float(end_seconds),
+                }
+                if ChatMessage is not None and self.session is not None:
+                    ChatMessage(content=json.dumps(payload), session_id=self.session.id, role="tool").save_to_supabase()
+            except Exception:
+                pass
+            return "queued"
+
+        self._tools = [_display_video_segment]
+        try:
+            self._llm_with_tools = self.llm.bind_tools(self._tools)
+        except Exception:
+            self._llm_with_tools = self.llm
 
     def _ensure_session_saved(self) -> None:
         if self.session is None:
@@ -371,8 +439,11 @@ Here are the candidate clips (JSON):
             content = getattr(m, "content", "")
             if role == "assistant":
                 history_msgs.append(AIMessage(content=content))
-            else:
+            elif role == "user":
                 history_msgs.append(HumanMessage(content=content))
+            else:
+                # Skip tool/system/other persisted roles in the prompt history
+                continue
 
         system_msg = SystemMessage(content=self._build_system_prompt())
 
@@ -380,6 +451,8 @@ Here are the candidate clips (JSON):
         if self._langchain_media_parts:
             # Compose turn with attached videos
             user_content: List[Dict[str, Any]] = []
+            # Provide mapping of uuids so the model can reference them in tool calls
+            user_content.append({"type": "text", "text": self._build_available_clips_text()})
             user_content.append({"type": "text", "text": "Use attached clips as gentle cues (do not force)."})
             for part in self._langchain_media_parts:
                 user_content.append(part)
@@ -398,12 +471,51 @@ Here are the candidate clips (JSON):
             print("🧠 Invoking Gemini chat model...")
         except Exception:
             pass
-        ai_response = self.llm.invoke(messages)
+        # Prefer tool-enabled model if available
+        llm_runner = self._llm_with_tools or self.llm
+        ai_response = llm_runner.invoke(messages)
         try:
             print("✅ Received model reply")
         except Exception:
             pass
         ai_text: str = getattr(ai_response, "content", "") if ai_response else ""
+
+        # Persist any tool calls the model issued
+        try:
+            tool_calls = getattr(ai_response, "tool_calls", None)
+            if not tool_calls:
+                # Some providers put tool calls under additional_kwargs
+                tool_calls = (getattr(ai_response, "additional_kwargs", {}) or {}).get("tool_calls", [])
+            for tc in (tool_calls or []):
+                name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+                args = getattr(tc, "args", None) or (tc.get("args") if isinstance(tc, dict) else None)
+                if name != "display_video_segment" or not args:
+                    continue
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        continue
+                uuid_val = str(args.get("uuid", ""))
+                try:
+                    start_val = float(args.get("start_seconds"))
+                    end_val = float(args.get("end_seconds"))
+                except Exception:
+                    continue
+                payload: Dict[str, Any] = {
+                    "tool": "display_video_segment",
+                    "uuid": uuid_val,
+                    "start_seconds": start_val,
+                    "end_seconds": end_val,
+                }
+                if ChatMessage is not None and self.session is not None:
+                    try:
+                        ChatMessage(content=json.dumps(payload), session_id=self.session.id, role="tool").save_to_supabase()
+                        return 
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # Persist messages
         if ChatMessage is None:
@@ -456,8 +568,44 @@ Here are the candidate clips (JSON):
             pass
 
         messages: List[Any] = [system_msg, HumanMessage(content=user_content)]
-        ai_response = self.llm.invoke(messages)
+        llm_runner = self._llm_with_tools or self.llm
+        ai_response = llm_runner.invoke(messages)
         ai_text: str = getattr(ai_response, "content", "") if ai_response else ""
+
+        # Persist any tool calls the model issued on kickoff
+        try:
+            tool_calls = getattr(ai_response, "tool_calls", None)
+            if not tool_calls:
+                tool_calls = (getattr(ai_response, "additional_kwargs", {}) or {}).get("tool_calls", [])
+            for tc in (tool_calls or []):
+                name = getattr(tc, "name", None) or (tc.get("name") if isinstance(tc, dict) else None)
+                args = getattr(tc, "args", None) or (tc.get("args") if isinstance(tc, dict) else None)
+                if name != "display_video_segment" or not args:
+                    continue
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        continue
+                uuid_val = str(args.get("uuid", ""))
+                try:
+                    start_val = float(args.get("start_seconds"))
+                    end_val = float(args.get("end_seconds"))
+                except Exception:
+                    continue
+                payload: Dict[str, Any] = {
+                    "tool": "display_video_segment",
+                    "uuid": uuid_val,
+                    "start_seconds": start_val,
+                    "end_seconds": end_val,
+                }
+                if ChatMessage is not None and self.session is not None:
+                    try:
+                        ChatMessage(content=json.dumps(payload), session_id=self.session.id, role="tool").save_to_supabase()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         # Persist only assistant kickoff message
         if ChatMessage is None:
@@ -502,7 +650,7 @@ def main() -> None:
         "--model", dest="model_name", default="gemini-2.5-flash", help="Gemini model name"
     )
     parser.add_argument(
-        "--table", dest="table_name", default="test_videos", help="Supabase table holding videos"
+        "--table", dest="table_name", default="videos", help="Supabase table holding videos"
     )
     parser.add_argument(
         "--ts-col", dest="timestamp_column", default="time_created", help="Timestamp column for filtering"
@@ -529,6 +677,10 @@ def main() -> None:
                 model=agent.model_name,
                 google_api_key=agent.gemini_api_key,
             )
+            try:
+                agent._init_tools()
+            except Exception:
+                pass
     except Exception:
         pass
 
