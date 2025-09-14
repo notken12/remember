@@ -2,7 +2,8 @@
 
 import asyncio
 import os
-from typing import List, Literal, TypedDict, Dict, Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -195,6 +196,248 @@ def configure_sr_from_env(state: Dict[str, Any]) -> None:
     # Video source configuration is read where discovery is performed; export defaults via env
     sr.setdefault("video_table", os.getenv("SR_VIDEO_TABLE", DEFAULT_VIDEO_TABLE))
     sr.setdefault("video_ts_column", os.getenv("SR_VIDEO_TS_COLUMN", DEFAULT_VIDEO_TS_COLUMN))
+
+
+# ---------------------------------------------------------------------
+# Phase 2: Pure state helpers (discovery, selection, scheduling, sessions)
+# ---------------------------------------------------------------------
+
+def _to_naive_utc(dt: datetime) -> datetime:
+    if getattr(dt, "tzinfo", None) is not None:
+        try:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return datetime.utcnow()
+    return dt
+
+
+def _to_iso(dt: datetime) -> str:
+    return _to_naive_utc(dt).isoformat()
+
+
+def _parse_iso(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return _to_naive_utc(dt)
+    except Exception:
+        return None
+
+
+def _dedupe_preserve_order(ids: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for x in ids:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def load_recent_video_ids(state: Dict[str, Any]) -> List[str]:
+    """Load recent video UUIDs from Supabase (videos table).
+
+    Orders by configured timestamp column desc; falls back to `created_at`.
+    Respects `sr.candidate_limit`.
+    """
+    sr = ensure_sr_slice(state)
+    table = str(sr.get("video_table", DEFAULT_VIDEO_TABLE))
+    ts_col = str(sr.get("video_ts_column", DEFAULT_VIDEO_TS_COLUMN))
+    limit = int(sr.get("candidate_limit", DEFAULT_CANDIDATE_LIMIT))
+
+    try:
+        # Preferred ordering by configured timestamp column
+        query = supabase.table(table).select(f"id, {ts_col}").order(ts_col, desc=True)
+        if limit:
+            query = query.limit(limit)
+        resp = query.execute()
+        data = resp.data or []
+        ids = [str(row["id"]) for row in data if row.get("id")]
+        if ids:
+            return _dedupe_preserve_order(ids)
+    except Exception:
+        pass
+
+    # Fallback ordering by created_at
+    try:
+        query = supabase.table(table).select("id, created_at").order("created_at", desc=True)
+        if limit:
+            query = query.limit(limit)
+        resp = query.execute()
+        data = resp.data or []
+        ids = [str(row["id"]) for row in data if row.get("id")]
+        return _dedupe_preserve_order(ids)
+    except Exception:
+        return []
+
+
+def select_first_n(candidates: List[str], n: int) -> List[str]:
+    if n <= 0:
+        return []
+    return list(_dedupe_preserve_order(candidates)[:n])
+
+
+def enqueue(
+    state: Dict[str, Any],
+    *,
+    clip_id: str,
+    questions: List[QuestionState],
+    interval_index: int,
+    base_time: Optional[datetime] = None,
+    attempt_count: int = 0,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    sr = ensure_sr_slice(state)
+    intervals = sr.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    if interval_index < 0 or interval_index >= len(intervals):
+        raise ValueError("interval_index out of range")
+    reference = _to_naive_utc(base_time or datetime.utcnow())
+    next_at = reference + timedelta(seconds=int(intervals[interval_index]))
+    item: QueueItemState = {
+        "clip_id": clip_id,
+        "next_at": _to_iso(next_at),
+        "interval_index": int(interval_index),
+        "attempt_count": int(attempt_count) if attempt_count >= 0 else 0,
+        "questions": list(questions or []),
+        "meta": dict(meta) if meta else {},
+    }
+    q = sr.get("queue", []) or []
+    q.append(item)
+    sr["queue"] = q
+
+
+def _head_due_index(q: List[QueueItemState], now_dt: datetime) -> Optional[int]:
+    best_idx: Optional[int] = None
+    best_time: Optional[datetime] = None
+    for idx, it in enumerate(q):
+        dt = _parse_iso(it.get("next_at", ""))
+        if dt is None:
+            continue
+        if now_dt >= dt:
+            if best_time is None or dt < best_time:
+                best_time = dt
+                best_idx = idx
+    return best_idx
+
+
+def get_next_due(state: Dict[str, Any], now: Optional[datetime] = None) -> Optional[QueueItemState]:
+    sr = ensure_sr_slice(state)
+    q = sr.get("queue", []) or []
+    now_dt = _to_naive_utc(now or datetime.utcnow())
+    idx = _head_due_index(q, now_dt)
+    return q[idx] if idx is not None else None
+
+
+def pop_next_due(state: Dict[str, Any], now: Optional[datetime] = None) -> Optional[QueueItemState]:
+    sr = ensure_sr_slice(state)
+    q = sr.get("queue", []) or []
+    now_dt = _to_naive_utc(now or datetime.utcnow())
+    idx = _head_due_index(q, now_dt)
+    if idx is None:
+        return None
+    item = q.pop(idx)
+    sr["queue"] = q
+    return item
+
+
+def begin_session(state: Dict[str, Any], item: QueueItemState) -> str:
+    """Create an active session from a queue item and return first prompt."""
+    sr = ensure_sr_slice(state)
+    questions = item.get("questions", []) or []
+    sr["active_session"] = {
+        "clip_id": item.get("clip_id", ""),
+        "q_index": 0,
+        "exchanges": [],
+        "interval_index": int(item.get("interval_index", 0)),
+        "questions": list(questions),
+        "attempt_count": int(item.get("attempt_count", 0)),
+    }
+    return current_prompt(state) or "Take a moment to recall one detail from this clip."
+
+
+def current_prompt(state: Dict[str, Any]) -> Optional[str]:
+    sr = ensure_sr_slice(state)
+    sess = sr.get("active_session")
+    if not isinstance(sess, dict):
+        return None
+    qs = sess.get("questions", []) or []
+    q_index = int(sess.get("q_index", 0))
+    if q_index < 0 or q_index >= len(qs):
+        return None
+    text = str(qs[q_index].get("text_cue", "")).strip()
+    return text or None
+
+
+def append_answer_and_advance(state: Dict[str, Any], answer: str) -> None:
+    sr = ensure_sr_slice(state)
+    sess = sr.get("active_session")
+    if not isinstance(sess, dict):
+        return
+    qs = sess.get("questions", []) or []
+    q_index = int(sess.get("q_index", 0))
+    if q_index < 0 or q_index >= len(qs):
+        return
+    question_text = str(qs[q_index].get("text_cue", ""))
+    exchanges = list(sess.get("exchanges", []))
+    exchanges.append({"question": question_text, "user": str(answer or "").strip(), "assessment": ""})
+    sess["exchanges"] = exchanges
+    sess["q_index"] = q_index + 1
+    sr["active_session"] = sess
+
+
+def session_finished(state: Dict[str, Any]) -> bool:
+    sr = ensure_sr_slice(state)
+    sess = sr.get("active_session")
+    if not isinstance(sess, dict):
+        return True
+    qs = sess.get("questions", []) or []
+    q_index = int(sess.get("q_index", 0))
+    return q_index >= len(qs)
+
+
+def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return {score: float, success: bool} using 0.7 threshold on non-empty answers."""
+    sr = ensure_sr_slice(state)
+    sess = sr.get("active_session")
+    if not isinstance(sess, dict):
+        return {"score": 0.0, "success": False}
+    qs = sess.get("questions", []) or []
+    exchanges = list(sess.get("exchanges", []))
+    total = max(1, len(qs))
+    answered = 0
+    for ex in exchanges:
+        try:
+            if str(ex.get("user", "")).strip():
+                answered += 1
+        except Exception:
+            continue
+    score = min(1.0, answered / float(total))
+    return {"score": score, "success": score >= 0.7}
+
+
+def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = None) -> None:
+    """Reschedule the active session clip at the next/previous interval and clear session."""
+    sr = ensure_sr_slice(state)
+    sess = sr.get("active_session")
+    if not isinstance(sess, dict):
+        return
+    next_idx: int
+    intervals = sr.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    last_index = len(intervals) - 1
+    cur_idx = int(sess.get("interval_index", 0))
+    if success:
+        next_idx = min(cur_idx + 1, last_index)
+    else:
+        next_idx = max(cur_idx - 1, 0)
+    attempt = int(sess.get("attempt_count", 0)) + 1
+    clip_id = str(sess.get("clip_id", ""))
+    questions = list(sess.get("questions", []))
+    enqueue(state, clip_id=clip_id, questions=questions, interval_index=next_idx, base_time=now or datetime.utcnow(), attempt_count=attempt)
+    sr["active_session"] = None
 
 
 async def main():
