@@ -10,9 +10,8 @@ from dotenv import load_dotenv
 from SRQuestionGenerator import QuestionGenerator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode, create_react_agent, tools_condition
-# from postgres import AsyncPostgresSaver  # Lazily imported in _initialize_agent to avoid libpq issues in tests
+from langgraph.graph import START, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
 from agent_state import State, get_state_from_supabase
@@ -672,7 +671,7 @@ def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = N
 
 
 # ---------------------------------------------------------------------
-# Runner (LangGraph agent) - mirrors esi_agent.py
+# LangGraph prompts & graph setup (mirrors esi_agent.py)
 # ---------------------------------------------------------------------
 
 
