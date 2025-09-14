@@ -27,65 +27,79 @@ export default function DemoPage() {
         const sse = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
         sseRef.current = sse;
 
-        sse.onopen = () => {
+        sse.onopen = async () => {
             console.log('SSE connection opened');
+            let controller: ReadableStreamDefaultController<UIMessageChunk> | null = null
 
-            // Create the ReadableStream and store reference to prevent garbage collection
-            const stream = new ReadableStream<UIMessageChunk>({
-                start(controller) {
-                    sse.onmessage = (event) => {
-                        console.log('SSE message received:', event)
-                        try {
-                            // Parse the event data and enqueue it
-                            const data = JSON.parse(event.data);
-                            if (data.type === 'data-transcription') {
-                                setTranscription(data.data.text)
-                                setTranscriptionIsFinal(data.data.isFinal)
-                                console.log('transcription: ', data.data.text)
-                            }
-                            controller.enqueue(data);
-                        } catch (error) {
-                            console.error('Error parsing SSE data:', error);
+            sse.onmessage = (event) => {
+                console.log('SSE message received:', event)
+                if (!controller) return
+                try {
+                    // Parse the event data and enqueue it
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'data-transcription') {
+                        setTranscription(data.data.text)
+                        setTranscriptionIsFinal(data.data.is_final)
+                        if (data.data.is_final) {
+                            console.log('FINAL TRANSCRIPTION')
+                            setMessages(prev => [...prev, { id: crypto.randomUUID().toString(), "role": "user", "parts": [{ "type": "text", text: data.data.text }] }])
                         }
-                    };
-
-                    sse.onerror = (error) => {
-                        console.error('SSE error:', error);
-                        controller.error(error);
-                    };
-                },
-                cancel() {
-                    console.log('ReadableStream cancelled')
-                    // Only close SSE if we're actually cleaning up, not if stream is just being cancelled
-                    if (isCleaningUpRef.current && sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
-                        sseRef.current.close();
+                        console.log('transcription: ', data.data.text)
+                    } else if (data.type === "finish") {
+                    } else {
+                        setTranscription("")
+                        setTranscriptionIsFinal(false)
                     }
-                },
-            });
+                    controller.enqueue(data);
+                } catch (error) {
+                    console.error('Error parsing SSE data:', error);
+                }
+            };
+            sse.onerror = (error) => {
+                console.error('SSE error:', error);
+                controller?.error(error);
+            };
 
-            streamRef.current = stream;
+            const createAndProcessStream = async (): Promise<void> => {
+                // Create the ReadableStream and store reference to prevent garbage collection
+                const stream = new ReadableStream<UIMessageChunk>({
+                    start(c) {
+                        controller = c
+                    },
+                    cancel() {
+                        console.log('ReadableStream cancelled')
+                        // Only close SSE if we're actually cleaning up, not if stream is just being cancelled
+                        if (isCleaningUpRef.current && sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
+                            sseRef.current.close();
+                        }
+                    },
+                });
 
-            // Process the stream in a separate async function
-            processUIMessageStream(stream);
-        };
+                streamRef.current = stream;
 
-        sse.onerror = (error) => {
-            console.error('SSE connection error:', error);
+                // Process the stream in a separate async function
+                await processUIMessageStream(stream);
+
+                console.log('Stream closed, creating new stream for continued processing...');
+                await createAndProcessStream(); // Subsequent streams are not the first
+            };
+
+            await createAndProcessStream();
         };
 
         const processUIMessageStream = async (stream: ReadableStream<UIMessageChunk>) => {
             try {
                 for await (const uiMessage of readUIMessageStream({ stream })) {
                     setMessages(produce(prev => {
-                        // Avoid duplicates by checking if message already exists
-                        const index = prev.findIndex(m => m.id === uiMessage.id);
-                        if (index == -1) {
-                            // @ts-expect-error deep
-                            prev.push(uiMessage)
-                        } else {
-                            prev[index] = uiMessage
+                        const matching = prev.findIndex(m => m.id === uiMessage.id)
+                        if (matching != -1) {
+                            prev[matching] = uiMessage
+                            console.log('matching', uiMessage)
                         }
-                        return prev
+                        else {
+                            prev.push(uiMessage)
+                            console.log('new', uiMessage)
+                        }
                     }));
                 }
             } catch (error) {

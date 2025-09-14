@@ -97,17 +97,24 @@ def prepare_video_context(memory_uuids: List[str]) -> List[MediaPart]:
     return media_parts
 
 
+class Video(TypedDict):
+    uuid: str
+    annotation: str
+    time_created: str
+
+
 def extract_memories(
     start_time_iso: Optional[str] = None,
     end_time_iso: Optional[str] = None,
     limit: Optional[int] = None,
     max_items: int = 3,
-) -> List[MediaPart]:
+) -> List[Video]:
     """Implementation of memory extraction."""
     print("Fetching annotated videos...")
     candidates = fetch_annotated_videos(start_time_iso, end_time_iso, limit)
-    print("Selecting memories...")
-    selected = select_memories_with_gemini(candidates, max_items)
+    # print("Selecting memories...")
+    # selected = select_memories_with_gemini(candidates, max_items)
+    selected = candidates
 
     # Add annotations to selected memories
     uuid_to_annotation = {c["uuid"]: c.get("annotation", "") for c in candidates}
@@ -115,17 +122,19 @@ def extract_memories(
         if item["uuid"] in uuid_to_annotation:
             item["annotation"] = uuid_to_annotation[item["uuid"]]
 
-    print("Preparing video context...")
-    video_media_parts = prepare_video_context([item["uuid"] for item in selected])
+    return selected
 
-    return video_media_parts
+    # print("Preparing video context...")
+    # video_media_parts = prepare_video_context([item["uuid"] for item in selected])
+
+    # return video_media_parts
 
 
 def fetch_annotated_videos(
     start_time_iso: Optional[str] = None,
     end_time_iso: Optional[str] = None,
     limit: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Video]:
     """Fetch annotated videos from Supabase."""
     query = (
         supabase.table("videos")
@@ -267,14 +276,22 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
     kickoff_message = "Finally, greet the patient warmly and ask ONE gentle, concrete recall question based on the prepared memories."
 
     print("Extracting memories...")
-    video_media_parts = extract_memories()
+    videos = extract_memories()
 
     ChatSession(session_id=str(session_id)).save_to_supabase()
 
     initial_message = HumanMessage(
         content=[
             {"type": "text", "text": kickoff_message},
-            *video_media_parts,
+            {
+                "type": "text",
+                "text": "\n\nHere are video memories from the patient's smart glasses to help guide your questions:",
+            },
+            *[
+                {"type": "text", "text": f"Memory {i + 1}: {video['annotation']}"}
+                for i, video in enumerate(videos)
+            ],
+            # *video_media_parts,
         ]
     )
     supabase.table("chat_messages").insert(

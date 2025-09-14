@@ -1,5 +1,6 @@
 import { AppServer, AppSession } from "@mentra/sdk"
 import { createClient } from '@supabase/supabase-js'
+import { randomUUID } from "crypto"
 // Create Supabase client
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!)
 
@@ -17,18 +18,21 @@ class MyMentraOSApp extends AppServer {
   protected override async onSession(session: AppSession, sessionId: string, userId: string): Promise<void> {
     session.logger.info(`New session: ${sessionId} for user ${userId}`)
 
+    let currentEsiSessionId: string | null = null
+    let aiTalking = false
+
     session.events.onButtonPress(async (e) => {
       session.logger.info(`Button pressed: ${e.buttonId}`)
-
-      // const photo = await session.camera.requestPhoto({ saveToGallery: false })
-      // session.logger.info(`Photo taken: ${photo.filename} ${photo.buffer.length} bytes ${photo.timestamp}`)
-      // const { data, error } = await supabase.storage.from("memories").upload(photo.filename, photo.buffer, { contentType: photo.mimeType })
-      // if (error) {
-      //   session.logger.error(`Error uploading photo: ${error.message}`)
-      // } else {
-      //   session.logger.info(`Photo uploaded: ${data.path}`)
-      // }
-
+      currentEsiSessionId = randomUUID().toString()
+      const searchParams = new URLSearchParams({ session_id: currentEsiSessionId })
+      const url = process.env.BACKEND_URL + "/esi_session?" + searchParams.toString()
+      session.logger.info(`Starting ESI session`)
+      aiTalking = true
+      await fetch(url, {
+        method: "POST",
+      })
+      aiTalking = false
+      session.logger.info(`ESI session started`)
     })
 
     session.events.onTranscription(async (data) => {
@@ -39,6 +43,15 @@ class MyMentraOSApp extends AppServer {
         method: "POST",
       })
       session.logger.info(`Transcription sent to backend: ${data.text}`)
+      if (data.isFinal && !aiTalking && currentEsiSessionId) {
+        const searchParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: data.text })
+        const url = process.env.BACKEND_URL + "/esi_chat?" + searchParams.toString()
+        aiTalking = true
+        await fetch(url, {
+          method: "POST",
+        })
+        aiTalking = false
+      }
     })
 
     const statusUnsubscribe = session.camera.onManagedStreamStatus((data) => {
