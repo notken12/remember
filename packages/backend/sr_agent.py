@@ -695,13 +695,27 @@ class SRAgentRunner:
                 _log_sr_error(state, "Failed to prepare media context for selected clips", e)
         sr["media_attached_clips"] = list(selected)
 
-        # If an item is due now, start session (fast-start will come in next phase)
+        # Fast-start: immediately start the earliest enqueued item regardless of time
         first_prompt: Optional[str] = None
-        due = get_next_due(state, now=now)
-        if due is not None:
-            item = pop_next_due(state, now=now)
-            if item is not None:
+        try:
+            q = sr.get("queue", []) or []
+            earliest_idx: Optional[int] = None
+            earliest_time: Optional[datetime] = None
+            for idx, it in enumerate(q):
+                dt = _parse_iso(it.get("next_at", "")) or now
+                if earliest_time is None or dt < earliest_time:
+                    earliest_time = dt
+                    earliest_idx = idx
+            if earliest_idx is not None:
+                item = q.pop(earliest_idx)
+                sr["queue"] = q
                 first_prompt = begin_session(state, item)
+                set_stage(state, "session_active")
+            else:
+                set_stage(state, "kickoff")
+        except Exception as e:
+            _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
+            set_stage(state, "kickoff")
 
         # Build streaming payload
         system_prompt = _build_system_prompt()
@@ -782,10 +796,9 @@ class SRAgentRunner:
             if not session_finished(state):
                 prompt = current_prompt(state) or "Notice one concrete detail you remember from this clip."
                 clip_id = str(sess.get("clip_id", ""))
-                media_parts = prepare_video_context([clip_id]) if clip_id else []
+                # Do not reattach media; it was attached once at kickoff
                 human_content = [
                     {"type": "text", "text": " ".join(feedback_lines) + f"\nNext question (ask exactly as written): {prompt}"},
-                    *media_parts,
                 ]
             else:
                 result = evaluate_session(state)
@@ -802,11 +815,9 @@ class SRAgentRunner:
                 item = pop_next_due(state, now=now)
                 if item is not None:
                     prompt = begin_session(state, item)
-                    clip_id = item.get("clip_id", "")
-                    media_parts = prepare_video_context([clip_id]) if clip_id else []
+                    # Do not reattach media in chat; context exists from kickoff
                     human_content = [
-                        {"type": "text", "text": f"Begin the next session and ask exactly this: {prompt}"},
-                        *media_parts,
+                        {"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"},
                     ]
                 else:
                     human_content = [
