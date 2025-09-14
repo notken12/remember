@@ -32,8 +32,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING
+import heapq
 
 # External dependencies used elsewhere in the codebase
 from dotenv import load_dotenv
@@ -216,6 +217,12 @@ class QueueItem:
         except Exception:
             # Fallback to immediate due if timestamp missing/invalid
             next_at_dt = datetime.utcnow()
+        # Normalize to naive UTC for consistent comparisons
+        if getattr(next_at_dt, "tzinfo", None) is not None:
+            try:
+                next_at_dt = next_at_dt.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                next_at_dt = datetime.utcnow()
 
         questions_payload = state.get("questions", []) or []
         questions: List[Question] = []
@@ -297,8 +304,9 @@ class SRAgent:
             list(interval_seconds) if interval_seconds else list(DEFAULT_INTERVAL_SECONDS)
         )
         self._questions_per_clip: int = int(questions_per_clip)
-        # Priority queue stored as a simple list; implementations will use heapq
-        self._queue: List[QueueItem] = []
+        # Priority queue implemented as a binary heap of (next_at, seq, item)
+        self._heap: List[Tuple[datetime, int, QueueItem]] = []
+        self._heap_seq: int = 0  # tie-breaker to maintain stable ordering
         # Cache of prepared questions per clip_id
         self._clip_questions: Dict[str, List[Question]] = {}
         # Deterministic subset chosen for this SR run
@@ -474,8 +482,31 @@ class SRAgent:
             - Compute `next_at = base_time + interval_seconds[interval_index]`.
             - Push a `QueueItem` to the internal heap/ordered structure.
         """
-        # No implementation yet
-        pass
+        if interval_index < 0 or interval_index >= len(self._interval_seconds):
+            raise ValueError("interval_index out of range for configured schedule")
+
+        reference_time = base_time or datetime.utcnow()
+        # Ensure naive UTC for comparisons
+        if getattr(reference_time, "tzinfo", None) is not None:
+            try:
+                reference_time = reference_time.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                reference_time = datetime.utcnow()
+
+        delay_seconds = int(self._interval_seconds[interval_index])
+        next_at = reference_time + timedelta(seconds=delay_seconds)
+
+        item = QueueItem(
+            clip_id=clip_id,
+            questions=list(questions),
+            next_at=next_at,
+            interval_index=interval_index,
+            attempt_count=0,
+            meta=dict(meta) if meta else {},
+        )
+
+        self._heap_seq += 1
+        heapq.heappush(self._heap, (item.next_at, self._heap_seq, item))
 
     def get_next_due_item(self, *, now: Optional[datetime] = None) -> Optional[QueueItem]:
         """Return the next due queue item if any (peek without removal).
@@ -487,8 +518,16 @@ class SRAgent:
             The head `QueueItem` if it is due (`now >= next_at`); otherwise
             `None`. This does not remove the item from the queue.
         """
-        # No implementation yet
-        pass
+        if not self._heap:
+            return None
+        reference_time = now or datetime.utcnow()
+        if getattr(reference_time, "tzinfo", None) is not None:
+            try:
+                reference_time = reference_time.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                reference_time = datetime.utcnow()
+        head_next_at, _seq, head_item = self._heap[0]
+        return head_item if reference_time >= head_next_at else None
 
     def pop_next_due_item(self, *, now: Optional[datetime] = None) -> Optional[QueueItem]:
         """Pop and return the next due item if ready; else return None.
@@ -499,8 +538,19 @@ class SRAgent:
         Returns:
             The removed `QueueItem` if due, otherwise `None`.
         """
-        # No implementation yet
-        pass
+        if not self._heap:
+            return None
+        reference_time = now or datetime.utcnow()
+        if getattr(reference_time, "tzinfo", None) is not None:
+            try:
+                reference_time = reference_time.astimezone(timezone.utc).replace(tzinfo=None)
+            except Exception:
+                reference_time = datetime.utcnow()
+        head_next_at, _seq, head_item = self._heap[0]
+        if reference_time >= head_next_at:
+            _ = heapq.heappop(self._heap)
+            return head_item
+        return None
 
     # ---------------------------------------------------------------------
     # Single-clip session flow
