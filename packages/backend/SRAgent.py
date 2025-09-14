@@ -352,7 +352,10 @@ class SRAgent:
 
         try:
             client: Client = create_client(url, key)
-        except Exception:
+        except Exception as e:
+            # Optionally record a lightweight error trace in memory for debugging
+            # (LangGraph layer may choose to project this into state/logs)
+            _ = e
             return []
 
         # Try ordering by preferred timestamp columns first
@@ -367,7 +370,8 @@ class SRAgent:
                 ids = [str(row["id"]) for row in data if row.get("id")]
                 if ids:
                     return ids
-            except Exception:
+            except Exception as e:
+                _ = e
                 continue
 
         # Final fallback: no ordering, only IDs
@@ -379,7 +383,8 @@ class SRAgent:
             data = resp.data or []
             ids = [str(row.get("id")) for row in data if row.get("id")]
             return ids
-        except Exception:
+        except Exception as e:
+            _ = e
             return []
 
     # ---------------------------------------------------------------------
@@ -480,8 +485,12 @@ class SRAgent:
 
         # Enqueue each selected clip at interval index 0
         now_ref = datetime.utcnow()
+        enqueued_count = 0
         for cid in selected:
             qlist = questions_map.get(cid, []) or []
+            # Skip clips with no questions to avoid dead sessions
+            if not qlist:
+                continue
             try:
                 self.enqueue_clip_for_spaced_retrieval(
                     cid,
@@ -490,6 +499,7 @@ class SRAgent:
                     base_time=now_ref,
                     meta={},
                 )
+                enqueued_count += 1
             except Exception:
                 # Skip enqueue failures to avoid blocking all clips
                 continue
@@ -501,7 +511,23 @@ class SRAgent:
         except Exception:
             pass
 
-        n = len(selected)
+        # Compose deterministic kickoff text with graceful fallbacks
+        if not candidate_ids:
+            return (
+                "I couldn't find any recent clips to practice right now. "
+                "Please try again later or check your connection."
+            )
+        if not selected:
+            return (
+                "I found clips, but none are selected for this session. "
+                "We can try again with a different selection."
+            )
+        if enqueued_count == 0:
+            return (
+                "I found some clips, but questions aren't ready yet. "
+                "We'll prepare the prompts and try again shortly."
+            )
+        n = enqueued_count
         return (
             f"We will practice recall for {n} short clip{'s' if n != 1 else ''}. "
             "When you're ready, say 'Begin'."
@@ -613,8 +639,16 @@ class SRAgent:
                     pass
                 return intro
 
-        # 3) Otherwise, idle small talk
-        message = self.small_talk_turn()
+        # 3) Otherwise, idle small talk with mild personalization
+        user_text_norm = (user_text or "").strip().lower()
+        if user_text_norm in {"begin", "start", "next", "go", "ready"}:
+            # If user asks to proceed, but nothing is due yet, be explicit
+            message = (
+                "Great—I'm ready when you are. We'll start as soon as the next "
+                "memory check is scheduled."
+            )
+        else:
+            message = self.small_talk_turn()
         try:
             self.save_sr_state()
         except Exception:
