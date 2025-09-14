@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple, AsyncGenerator
@@ -451,6 +452,61 @@ def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"score": score, "success": score >= 0.7}
 
 
+def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_answer: str) -> Dict[str, Any]:
+    """Use the chat model to judge if the user's answer is correct.
+
+    Returns a dict: {"correct": bool, "feedback": str, "correct_answer": str}
+    """
+    model = init_chat_model(model="gemini-2.5-flash", model_provider="google_genai")
+    instruction = (
+        "You are grading a short recall answer for spaced retrieval. "
+        "Decide strictly whether the user's answer matches the expected answer, allowing paraphrases and synonyms. "
+        "Consider semantic equivalence, not exact wording. "
+        "Output ONLY compact JSON: {\"correct\": true|false, \"feedback\": string, \"correct_answer\": string}. "
+        "Keep feedback one sentence."
+    )
+    payload = {
+        "question": question_text,
+        "expected_answer": expected_answer,
+        "user_answer": user_answer,
+    }
+    resp = model.invoke(
+        [
+            SystemMessage(content=instruction),
+            HumanMessage(content=f"Data:\n{json.dumps(payload, ensure_ascii=False)}"),
+        ]
+    )
+    text = resp.content if isinstance(resp.content, str) else getattr(resp, "content", "")
+    result = {"correct": False, "feedback": "", "correct_answer": expected_answer}
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            result["correct"] = bool(parsed.get("correct", False))
+            result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if result["correct"] else "That's not quite right.")
+            result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
+            return result
+    except Exception:
+        # salvage JSON if wrapped
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                parsed = json.loads(text[start : end + 1])
+                if isinstance(parsed, dict):
+                    result["correct"] = bool(parsed.get("correct", False))
+                    result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if result["correct"] else "That's not quite right.")
+                    result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
+                    return result
+        except Exception:
+            pass
+    # fallback heuristic
+    ua = (user_answer or "").strip().lower()
+    ea = (expected_answer or "").strip().lower()
+    if ua and (ua in ea or ea in ua):
+        return {"correct": True, "feedback": "Correct.", "correct_answer": expected_answer}
+    return {"correct": False, "feedback": "That's not quite right.", "correct_answer": expected_answer}
+
+
 def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = None) -> None:
     """Reschedule the active session clip at the next/previous interval and clear session."""
     sr = ensure_sr_slice(state)
@@ -647,20 +703,50 @@ class SRAgentRunner:
         sess = sr.get("active_session")
         human_content: List[Any]
         if isinstance(sess, dict):
+            # Evaluate user's answer with LLM against expected answer for the current question
+            qs = sess.get("questions", []) or []
+            q_index = int(sess.get("q_index", 0))
+            expected_answer = ""
+            question_text = ""
+            if 0 <= q_index < len(qs):
+                expected_answer = str(qs[q_index].get("answer", ""))
+                question_text = str(qs[q_index].get("text_cue", ""))
+            eval_res = _evaluate_answer_with_llm(question_text, expected_answer, user_message)
+
+            # Record assessment on the exchange and advance
             append_answer_and_advance(state, user_message)
+            # Patch the last exchange with assessment so evaluate_session can compute score
+            sess2 = ensure_sr_slice(state).get("active_session")
+            if isinstance(sess2, dict):
+                exchanges = list(sess2.get("exchanges", []))
+                if exchanges:
+                    exchanges[-1]["assessment"] = "correct" if eval_res.get("correct") else "incorrect"
+                    sess2["exchanges"] = exchanges
+                    ensure_sr_slice(state)["active_session"] = sess2
+
+            feedback_lines = []
+            if eval_res.get("correct"):
+                feedback_lines.append("Correct.")
+            else:
+                ca = str(eval_res.get("correct_answer", "")).strip()
+                feedback_lines.append("That's not quite right.")
+                if ca:
+                    feedback_lines.append(f"Correct answer: {ca}")
+
             if not session_finished(state):
                 prompt = current_prompt(state) or "Notice one concrete detail you remember from this clip."
                 clip_id = str(sess.get("clip_id", ""))
                 media_parts = prepare_video_context([clip_id]) if clip_id else []
                 human_content = [
-                    {"type": "text", "text": f"Thank them and ask exactly this next question: {prompt}"},
+                    {"type": "text", "text": " ".join(feedback_lines) + f"\nNext question (ask exactly as written): {prompt}"},
                     *media_parts,
                 ]
             else:
                 result = evaluate_session(state)
                 reschedule(state, success=bool(result.get("success", False)), now=datetime.utcnow())
+                summary = "Session complete. " + ("Strong recall." if result.get("success") else "We will revisit soon to reinforce.")
                 human_content = [
-                    {"type": "text", "text": "Nice job. Let them know we will circle back to this clip later based on how it went."},
+                    {"type": "text", "text": summary},
                 ]
         else:
             # No active session; if due, start; else small talk
