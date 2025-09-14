@@ -3,7 +3,7 @@
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple
+from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple, AsyncGenerator
 
 from dotenv import load_dotenv
 from SRQuestionGenerator import QuestionGenerator
@@ -511,7 +511,7 @@ class SRAgentRunner:
             state["sr"] = {}
         return state
 
-    async def kickoff(self) -> "async_generator[StreamProtocolPart, None]":
+    async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
         state = self._get_state()
         # Initialize config/defaults on sr slice
         configure_sr_from_env(state)
@@ -559,6 +559,8 @@ class SRAgentRunner:
 
         # Build streaming payload
         system_prompt = _build_system_prompt()
+        # Build messages list into state so checkpointer persists both messages and sr slice
+        messages: List[Any]
         if first_prompt:
             human_content: List[Any] = [
                 {"type": "text", "text": f"Greet briefly and ask exactly this question: {first_prompt}"},
@@ -569,22 +571,18 @@ class SRAgentRunner:
             human_content = [
                 {"type": "text", "text": f"We will practice recall for {n} short clips. Greet briefly and ask if they are ready to begin."},
             ]
+        # Compose full message list: start fresh for kickoff
+        state["messages"] = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_content),
+        ]
 
         async for part in parse_langgraph_stream(
-            self._agent.astream(
-                {
-                    "messages": [
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(content=human_content),
-                    ]
-                },
-                config=self.config,
-                stream_mode="messages",
-            )
+            self._agent.astream(state, config=self.config, stream_mode="messages")
         ):
             yield part
 
-    async def chat(self, user_message: str) -> "async_generator[StreamProtocolPart, None]":
+    async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
         state = self._get_state()
         sr = ensure_sr_slice(state)
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
@@ -635,18 +633,16 @@ class SRAgentRunner:
                     msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
                 human_content = [{"type": "text", "text": msg}]
 
+        # Append to existing messages in graph state (like esi_agent.py)
         system_prompt = _build_system_prompt()
+        prior_messages = state.get("messages", []) or []
+        state["messages"] = prior_messages + [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_content),
+        ]
+
         async for part in parse_langgraph_stream(
-            self._agent.astream(
-                {
-                    "messages": [
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(content=human_content),
-                    ]
-                },
-                config=self.config,
-                stream_mode="messages",
-            )
+            self._agent.astream(state, config=self.config, stream_mode="messages")
         ):
             yield part
 
