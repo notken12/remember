@@ -158,6 +158,7 @@ export default function DemoPage() {
                                         case "tool-select_video":
                                             return (
                                                 <Video
+                                                    key={partIndex}
                                                     uuid={part.input?.video_uuid}
                                                     controls
                                                     autoPlay
@@ -166,6 +167,7 @@ export default function DemoPage() {
                                         case "tool-show_image":
                                             return (
                                                 <Video
+                                                    key={partIndex}
                                                     uuid={part.input?.video_uuid}
                                                     muted
                                                     preload="metadata"
@@ -173,12 +175,14 @@ export default function DemoPage() {
                                             )
                                         case "tool-show_video_slice":
                                             return (
-                                                <VideoSlice uuid={part.input?.video_uuid} start={part.input?.start} end={part.input?.end} />
+                                                <VideoSlice
+                                                    key={partIndex}
+                                                    uuid={part.input?.video_uuid} start={part.input?.start} end={part.input?.end} />
                                             )
                                         case "tool-end_esi_session":
-                                            return <p>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
+                                            return <p key={partIndex}>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
                                         case "tool-end_sr_session":
-                                            return <p>SR session complete! You{"'"}re all done, congratulations!</p>
+                                            return <p key={partIndex}>SR session complete! You{"'"}re all done, congratulations!</p>
                                         default:
                                             if (part.type.startsWith('data-')) return null
                                             return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
