@@ -19,6 +19,7 @@ class MyMentraOSApp extends AppServer {
     session.logger.info(`New session: ${sessionId} for user ${userId}`)
 
     let currentEsiSessionId: string | null = null
+    let currentSRSessionId: string | null = null
     let aiTalking = false
     let accumulatedTranscription = ""
 
@@ -26,16 +27,46 @@ class MyMentraOSApp extends AppServer {
       session.logger.info(`Button pressed: ${e.buttonId}`)
 
       // If we have accumulated transcription and an active ESI session, submit it via button
-      if (accumulatedTranscription && currentEsiSessionId) {
-        session.logger.info(`Button-submitting accumulated transcription to ESI session: ${accumulatedTranscription}`)
-        const chatParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: accumulatedTranscription })
-        const chatUrl = process.env.BACKEND_URL + "/esi_chat?" + chatParams.toString()
-        aiTalking = true
-        await fetch(chatUrl, {
-          method: "POST",
-        })
-        aiTalking = false
-        session.logger.info(`Accumulated transcription button-submitted to ESI session`)
+      if (accumulatedTranscription) {
+        if (currentEsiSessionId) {
+          session.logger.info(`Button-submitting accumulated transcription to ESI session: ${accumulatedTranscription}`)
+          const chatParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: accumulatedTranscription })
+          const chatUrl = process.env.BACKEND_URL + "/esi_chat?" + chatParams.toString()
+          aiTalking = true
+          const response = await fetch(chatUrl, {
+            method: "POST",
+          })
+          const responseText = await response.text()
+          if (responseText.includes("end_esi_session")) {
+            session.logger.info(`ESI session ended`)
+            currentEsiSessionId = null
+            // Start the SR session
+            currentSRSessionId = randomUUID().toString()
+            const searchParams = new URLSearchParams({ session_id: currentSRSessionId })
+            const srUrl = process.env.BACKEND_URL + "/sr_session?" + searchParams.toString()
+            await fetch(srUrl, {
+              method: "POST",
+            })
+            session.logger.info(`SR session started`)
+          }
+          aiTalking = false
+          session.logger.info(`Accumulated transcription button-submitted to ESI session`)
+        } else if (currentSRSessionId) {
+          session.logger.info(`Button-submitting accumulated transcription to SR session: ${accumulatedTranscription}`)
+          const chatParams = new URLSearchParams({ session_id: currentSRSessionId, user_message: accumulatedTranscription })
+          const chatUrl = process.env.BACKEND_URL + "/sr_chat?" + chatParams.toString()
+          aiTalking = true
+          const response = await fetch(chatUrl, {
+            method: "POST",
+          })
+          const responseText = await response.text()
+          if (responseText.includes("end_sr_session")) {
+            session.logger.info(`SR session ended`)
+            currentSRSessionId = null
+          }
+          aiTalking = false
+          session.logger.info(`Accumulated transcription button-submitted to SR session`)
+        }
 
         // Clear the accumulated transcription after successful submission
         accumulatedTranscription = ""
