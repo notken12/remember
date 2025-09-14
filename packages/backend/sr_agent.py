@@ -1019,22 +1019,16 @@ class SRAgentRunner:
         # Build messages list into state so checkpointer persists both messages and sr slice
         messages: List[Any]
         if first_prompt:
-            human_content: List[Any] = [
-                {
-                    "type": "text",
-                    "text": f"Ask exactly this question to begin: {first_prompt}",
-                },
-            ]
+            kickoff_instruction: str = (
+                f"Ask exactly this question to begin: {first_prompt}"
+            )
         else:
             n = len(sr.get("enqueued_clips", []))
             if n == 0:
                 _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
-            human_content = [
-                {
-                    "type": "text",
-                    "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?",
-                },
-            ]
+            kickoff_instruction = (
+                f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?" # say the first part too maybe
+            )
         # Compose full message list: start fresh for kickoff, attach media once as context
         stage_prompt = _build_system_prompt_kickoff()
         state["messages"] = [
@@ -1049,7 +1043,7 @@ class SRAgentRunner:
                     *media_parts_all,
                 ]
             ),
-            HumanMessage(content=human_content),
+            SystemMessage(content=kickoff_instruction),
         ]
 
         # Persist SR slice in memory for continuity when no external checkpointer is present
@@ -1134,14 +1128,12 @@ class SRAgentRunner:
                     or "Notice one concrete detail you remember from this clip."
                 )
                 clip_id = str(sess.get("clip_id", ""))
-                # Do not reattach media; it was attached once at kickoff
-                human_content = [
-                    {
-                        "type": "text",
-                        "text": " ".join(feedback_lines)
-                        + f"\nNext question (ask exactly as written): {prompt}",
-                    },
-                ]
+                # Instruction for the assistant on how to respond next
+                system_instruction = (
+                    " ".join(feedback_lines)
+                    + f"\nNext question (ask exactly as written): {prompt}"
+                )
+                system_next = SystemMessage(content=system_instruction)
             else:
                 result = evaluate_session(state)
                 reschedule(
@@ -1154,9 +1146,7 @@ class SRAgentRunner:
                     if result.get("success")
                     else "We will revisit soon to reinforce."
                 )
-                human_content = [
-                    {"type": "text", "text": summary},
-                ]
+                system_next = SystemMessage(content=summary)
         else:
             # No active session
             now = datetime.utcnow()
@@ -1183,26 +1173,17 @@ class SRAgentRunner:
                             prior_messages.append(
                                 SystemMessage(content=_build_system_prompt_session())
                             )
-                        human_content = [
-                            {
-                                "type": "text",
-                                "text": f"Ask exactly this to begin: {prompt}",
-                            }
-                        ]
+                        system_next = SystemMessage(
+                            content=f"Ask exactly this to begin: {prompt}"
+                        )
                     else:
-                        human_content = [
-                            {
-                                "type": "text",
-                                "text": "We don't have a clip ready yet. Give me a moment.",
-                            }
-                        ]
+                        system_next = SystemMessage(
+                            content="We don't have a clip ready yet. Give me a moment." # modify this to be like "say something like: .."?
+                        )
                 else:
-                    human_content = [
-                        {
-                            "type": "text",
-                            "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'.",
-                        }
-                    ]
+                    system_next = SystemMessage(
+                        content="Please confirm you're ready and we'll begin: say 'ready' or 'begin'." # modify this to be like "say something like: .."?"."
+                    )
             else:
                 # Non-kickoff idle path: due check or small talk
                 due = get_next_due(state, now=now)
@@ -1214,19 +1195,13 @@ class SRAgentRunner:
                             prior_messages.append(
                                 SystemMessage(content=_build_system_prompt_session())
                             )
-                        human_content = [
-                            {
-                                "type": "text",
-                                "text": f"Ask exactly this to begin the next session: {prompt}",
-                            }
-                        ]
+                        system_next = SystemMessage(
+                            content=f"Ask exactly this to begin the next session: {prompt}"
+                        )
                     else:
-                        human_content = [
-                            {
-                                "type": "text",
-                                "text": "Acknowledge and offer a brief supportive remark while waiting.",
-                            }
-                        ]
+                        system_next = SystemMessage(
+                            content="Acknowledge and offer a brief supportive remark while waiting."
+                        )
                 else:
                     if set_stage(state, "waiting"):
                         prior_messages.append(
@@ -1236,12 +1211,12 @@ class SRAgentRunner:
                         msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
                     else:
                         msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
-                    human_content = [{"type": "text", "text": msg}]
+                    system_next = SystemMessage(content=msg)
 
         # Append control instruction only; do not re-add system prompts on chat turns
-        state["messages"] = prior_messages + [
-            HumanMessage(content=human_content),
-        ]
+        if 'system_next' in locals():
+            prior_messages.append(system_next)
+        state["messages"] = prior_messages
 
         # Persist SR slice in memory for continuity when no external checkpointer is present
         if hasattr(self, "_memory_state"):
