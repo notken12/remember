@@ -292,7 +292,16 @@ def _extract_sr_slice_from_messages(messages: List[Any]) -> Optional[Dict[str, A
 
 def _persist_messages_to_supabase(session_id: str, new_messages: List[Any]) -> None:
     try:
-        for msg in new_messages:
+        logger = _initialize_logger()
+    except Exception:
+        logger = None
+    try:
+        if logger:
+            try:
+                logger.info("[DEBUG] Persisting %d messages to chat_messages (session_id=%s)", len(new_messages or []), session_id)
+            except Exception:
+                pass
+        for idx, msg in enumerate(new_messages):
             data_payload = getattr(msg, "__dict__", None)
             if data_payload is None:
                 if isinstance(msg, dict):
@@ -307,6 +316,11 @@ def _persist_messages_to_supabase(session_id: str, new_messages: List[Any]) -> N
                 role = "assistant"
             elif getattr(msg, "type", "") == "tool":
                 role = "tool"
+            if logger:
+                try:
+                    logger.info("[DEBUG] Inserting message %d role=%s type=%s", idx, role, getattr(msg, "type", getattr(msg, "__class__", type(msg)).__class__.__name__ if hasattr(msg, "__class__") else "unknown"))
+                except Exception:
+                    pass
             supabase.table("chat_messages").insert(
                 {
                     "role": role,
@@ -316,7 +330,11 @@ def _persist_messages_to_supabase(session_id: str, new_messages: List[Any]) -> N
             ).execute()
     except Exception:
         # Non-fatal; continue
-        pass
+        try:
+            if logger:
+                logger.info("[DEBUG] Failed to persist messages for session_id=%s", session_id)
+        except Exception:
+            pass
 
 
 
@@ -1028,6 +1046,15 @@ class SRAgentRunner:
 
     async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
         state = get_state_from_supabase(self.session_id)
+        try:
+            _initialize_logger().info(
+                "[DEBUG] Kickoff load: session_id=%s, loaded_messages=%d, SUPABASE_URL=%s",
+                self.session_id,
+                len(state.get("messages", []) or []),
+                os.getenv("SUPABASE_URL", ""),
+            )
+        except Exception:
+            pass
         # Attach session id for logging context
         try:
             state["session_id"] = self.session_id
@@ -1040,6 +1067,15 @@ class SRAgentRunner:
             persisted_sr = _extract_sr_slice_from_messages(state.get("messages", []) or [])
             if isinstance(persisted_sr, dict):
                 state["sr"] = persisted_sr
+                try:
+                    _initialize_logger().info("[DEBUG] Kickoff rehydrate: found SR marker (stage=%s, queue=%d)", persisted_sr.get("stage"), len(persisted_sr.get("queue", []) or []))
+                except Exception:
+                    pass
+            else:
+                try:
+                    _initialize_logger().info("[DEBUG] Kickoff rehydrate: no SR marker found")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1177,6 +1213,10 @@ class SRAgentRunner:
         # Persist kickoff messages so history is durable
         try:
             _persist_messages_to_supabase(self.session_id, state["messages"])
+            try:
+                _initialize_logger().info("[DEBUG] Kickoff persisted %d messages", len(state.get("messages", [])))
+            except Exception:
+                pass
         except Exception:
             pass
         # Persist SR slice marker after kickoff configuration
@@ -1203,6 +1243,14 @@ class SRAgentRunner:
 
     async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
         state = get_state_from_supabase(self.session_id)
+        try:
+            _initialize_logger().info(
+                "[DEBUG] Chat load: session_id=%s, loaded_messages=%d",
+                self.session_id,
+                len(state.get("messages", []) or []),
+            )
+        except Exception:
+            pass
         # Attach session id for logging context
         try:
             state["session_id"] = self.session_id
@@ -1213,10 +1261,28 @@ class SRAgentRunner:
             persisted_sr = _extract_sr_slice_from_messages(state.get("messages", []) or [])
             if isinstance(persisted_sr, dict):
                 state["sr"] = persisted_sr
+                try:
+                    _initialize_logger().info("[DEBUG] Chat rehydrate: found SR marker (stage=%s, queue=%d)", persisted_sr.get("stage"), len(persisted_sr.get("queue", []) or []))
+                except Exception:
+                    pass
+            else:
+                try:
+                    _initialize_logger().info("[DEBUG] Chat rehydrate: no SR marker found")
+                except Exception:
+                    pass
         except Exception:
             pass
         sr = ensure_sr_slice(state)
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
+        try:
+            _initialize_logger().info(
+                "[DEBUG] Chat pre-branch: stage=%s queue_len=%d active=%s",
+                get_stage(state),
+                len(sr.get("queue", []) or []),
+                "yes" if isinstance(sr.get("active_session"), dict) else "no",
+            )
+        except Exception:
+            pass
 
         # If session active: record answer and determine next step
         sess = sr.get("active_session")
@@ -1376,6 +1442,10 @@ class SRAgentRunner:
             except Exception:
                 pass
         state["messages"] = prior_messages
+        try:
+            _initialize_logger().info("[DEBUG] Chat branch chosen; prior_messages now=%d", len(prior_messages))
+        except Exception:
+            pass
         # Persist SR slice marker after any SR state mutation on this turn
         try:
             sr_slice = ensure_sr_slice(state)
