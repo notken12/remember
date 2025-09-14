@@ -310,7 +310,6 @@ async def chat(
     # Use the persistent agent instead of creating a new one
     graph_state = get_state_from_supabase(session_id)
     graph_state["messages"] = graph_state["messages"] + [message]
-    print(graph_state)
     supabase.table("chat_messages").insert(
         {
             "role": "user",
