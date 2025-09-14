@@ -714,6 +714,17 @@ def _build_graph() -> StateGraph:
         )
         message = llm.invoke(state["messages"])  # type: ignore[index]
         state["messages"].append(message)
+        # Persist assistant message to Supabase like ESI
+        try:
+            supabase.table("chat_messages").insert(
+                {
+                    "role": "assistant",
+                    "data": message.__dict__,
+                    "session_id": str(state.get("session_id", "")),
+                }
+            ).execute()
+        except Exception:
+            pass
         return state
 
     graph_builder.add_node("agent", agent_node)
