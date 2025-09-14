@@ -263,16 +263,27 @@ def _log_sr_error(state: Dict[str, Any], msg: str, exc: Optional[BaseException] 
 
 
 def _extract_latest_sr_state_from_messages(messages: List[Any]) -> Optional[SRState]:
-    """Scan messages from newest to oldest for a SystemMessage named 'sr_state' and parse JSON content."""
+    """Scan messages from newest to oldest for a SystemMessage that carries SRState.
+
+    Primary: a SystemMessage with name == "sr_state" and JSON content.
+    Fallback: any SystemMessage whose content parses to a dict containing SR keys.
+    """
+    candidate_keys = {"interval_seconds", "questions_per_clip", "queue", "stage", "clip_questions"}
     for m in reversed(messages or []):
         try:
-            if m.__class__.__name__ == "SystemMessage" and getattr(m, "name", None) == "sr_state":
+            # Prefer explicit sr_state name
+            if m.__class__.__name__ == "SystemMessage":
+                name = getattr(m, "name", None)
                 raw = getattr(m, "content", "")
                 data = json.loads(raw) if isinstance(raw, str) else None
                 if isinstance(data, dict):
-                    # Coerce to SRState shape
-                    sr_state: SRState = data  # type: ignore[assignment]
-                    return sr_state
+                    if name == "sr_state":
+                        sr_state: SRState = data  # type: ignore[assignment]
+                        return sr_state
+                    # Fallback heuristic: detect SR-looking payloads
+                    if any(k in data for k in candidate_keys):
+                        sr_state_fb: SRState = data  # type: ignore[assignment]
+                        return sr_state_fb
         except Exception:
             continue
     return None
@@ -280,10 +291,27 @@ def _extract_latest_sr_state_from_messages(messages: List[Any]) -> Optional[SRSt
 
 def _persist_chat_message(session_id: str, role: str, message_obj: Any) -> None:
     try:
+        data = dict(getattr(message_obj, "__dict__", {}) or {})
+        # Ensure explicit type for robust deserialization
+        msg_type = getattr(message_obj, "type", None)
+        if not isinstance(msg_type, str) or not msg_type:
+            # Infer from class name
+            cname = message_obj.__class__.__name__.lower()
+            if "human" in cname:
+                msg_type = "human"
+            elif "system" in cname:
+                msg_type = "system"
+            elif "tool" in cname:
+                msg_type = "tool"
+            elif "ai" in cname:
+                msg_type = "ai"
+            else:
+                msg_type = "system"
+        data["type"] = msg_type
         supabase.table("chat_messages").insert(
             {
                 "role": role,
-                "data": message_obj.__dict__,
+                "data": data,
                 "session_id": str(session_id),
             }
         ).execute()
@@ -302,7 +330,22 @@ def _append_and_persist_sr_state(session_id: str, state: Dict[str, Any]) -> None
     msgs = state.get("messages", []) or []
     msgs.append(sr_msg)
     state["messages"] = msgs
-    _persist_chat_message(session_id, "system", sr_msg)
+    # Persist with explicit fields to ensure reliable deserialization
+    try:
+        supabase.table("chat_messages").insert(
+            {
+                "role": "system",
+                "data": {
+                    "type": "system",
+                    "content": payload,
+                    "name": "sr_state",
+                },
+                "session_id": str(session_id),
+            }
+        ).execute()
+    except Exception:
+        # Fallback to generic persistence if direct insert fails
+        _persist_chat_message(session_id, "system", sr_msg)
 
 
 # ---------------------------------------------------------------------
@@ -896,12 +939,56 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
     ):
         yield part
 
+def _load_latest_sr_state_via_supabase(session_id: str) -> Optional[SRState]:
+    """Fallback: directly query Supabase chat_messages for the latest sr_state payload.
+
+    Returns None if not found or on error.
+    """
+    try:
+        resp = (
+            supabase.table("chat_messages")
+            .select("role, data, created_at")
+            .eq("session_id", str(session_id))
+            .order("created_at", desc=True)
+            .execute()
+        )
+        rows = resp.data or []
+        candidate_keys = {"interval_seconds", "questions_per_clip", "queue", "stage", "clip_questions"}
+        for row in rows:
+            try:
+                data = row.get("data") or {}
+                if not isinstance(data, dict):
+                    continue
+                if data.get("type") != "system":
+                    # Accept based on role as well
+                    if str(row.get("role")) != "system":
+                        continue
+                if data.get("name") == "sr_state":
+                    content = data.get("content")
+                    if isinstance(content, str):
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict):
+                            return parsed  # type: ignore[return-value]
+                # Heuristic fallback
+                content = data.get("content")
+                if isinstance(content, str):
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and any(k in parsed for k in candidate_keys):
+                        return parsed  # type: ignore[return-value]
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
 async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
     graph = _build_graph()
     # Load existing message history from Supabase
     state: State = get_state_from_supabase(session_id)
     # Restore SR slice from latest persisted sr_state system message
     latest_sr = _extract_latest_sr_state_from_messages(state.get("messages", []))  # type: ignore[index]
+    if not latest_sr:
+        latest_sr = _load_latest_sr_state_via_supabase(str(session_id))
     if latest_sr:
         state["sr"] = latest_sr
     sr = ensure_sr_slice(state)  # type: ignore[arg-type]

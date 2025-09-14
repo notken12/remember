@@ -5,6 +5,7 @@ import sys
 import unittest
 import asyncio
 from typing import List
+import uuid
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -22,7 +23,7 @@ class TestSupabaseIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_kickoff_and_first_prompt_from_supabase(self):
         # Ensure we rely on Supabase discovery (clear fallback)
         os.environ.pop("SR_FALLBACK_CLIP_IDS", None)
-        session_id = "sr_int_test"
+        session_id = str(uuid.uuid4())
 
         received: List[str] = []
         async for part in kickoff(session_id):

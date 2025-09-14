@@ -5,6 +5,7 @@ import sys
 import unittest
 from datetime import datetime
 import asyncio
+import uuid
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -21,8 +22,19 @@ from sr_agent import (
     begin_session,
     append_answer_and_advance,
     evaluate_session,
+    _extract_latest_sr_state_from_messages,
+    _load_latest_sr_state_via_supabase,
 )
 from agent_state import get_state_from_supabase
+
+
+async def _await_sr_state(session_id: str, tries: int = 30, delay_s: float = 0.25):
+    for _ in range(tries):
+        sr_state = _load_latest_sr_state_via_supabase(session_id)
+        if isinstance(sr_state, dict) and sr_state:
+            return sr_state
+        await asyncio.sleep(delay_s)
+    return None
 
 
 class TestStageHelpers(unittest.TestCase):
@@ -75,13 +87,33 @@ class TestAssessmentScoring(unittest.TestCase):
         self.assertTrue(result2["success"])  # 1.0 >= 0.7
 
 
+# Gate Supabase-based roundtrip tests behind creds and explicit opt-in
+_require_supabase = all(
+    [
+        os.getenv("SUPABASE_URL"),
+        os.getenv("SUPABASE_SERVICE_ROLE_KEY"),
+        os.getenv("DATABASE_URL"),
+        os.getenv("GEMINI_API_KEY"),
+    ]
+) and os.getenv("SR_TEST_SRSTATE") in {"1", "true", "yes"}
+
+
+@unittest.skipUnless(_require_supabase, "Skipping sr_state Supabase roundtrip tests without creds/opt-in")
 class TestRunnerFlow(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Use fallback to avoid depending on Supabase for discovery
         os.environ["SR_FALLBACK_CLIP_IDS"] = "fake1,fake2"
         os.environ["SR_MAX_CLIPS"] = "1"
         os.environ["SR_FAST_START"] = "1"
-        self.session_id = "test_sr_phase_flow_api"
+        self.session_id = str(uuid.uuid4())
+
+    async def test_sr_state_roundtrip_after_kickoff(self):
+        # Run kickoff, then retrieve sr_state directly from Supabase messages
+        async for _ in kickoff(self.session_id):
+            break
+        sr_state = await _await_sr_state(self.session_id)
+        self.assertIsInstance(sr_state, dict, msg="sr_state not found in Supabase after kickoff")
+        self.assertIn(sr_state.get("stage"), ["kickoff", "session_active"])  # fast-start may set session_active
 
     async def test_fast_start_and_media_once(self):
         # Kickoff should attach media once and start first question (fast-start)
@@ -91,8 +123,12 @@ class TestRunnerFlow(unittest.IsolatedAsyncioTestCase):
             if len(parts) > 2:
                 break
 
-        state = get_state_from_supabase(self.session_id)
+        # Reload sr_state directly from Supabase and build minimal state for checks
+        sr_state = await _await_sr_state(self.session_id)
+        self.assertIsInstance(sr_state, dict, msg="sr_state not found in Supabase after kickoff (fast-start)")
+        state = {"messages": get_state_from_supabase(self.session_id).get("messages", []), "sr": sr_state}  # type: ignore[index]
         sr = ensure_sr_slice(state)
+
         # Fast-start implies session_active
         self.assertEqual(sr.get("stage"), "session_active")
         # Media attached list should match selected (size 1 due to SR_MAX_CLIPS)

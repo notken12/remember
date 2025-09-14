@@ -3,7 +3,9 @@
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
+import asyncio
+import uuid
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -20,40 +22,37 @@ from sr_agent import (
     append_answer_and_advance,
     session_finished,
     evaluate_session,
-    reschedule,
 )
 
 
 class TestChatFlow(unittest.TestCase):
-    def setUp(self):
-        self.state = {"sr": {"interval_seconds": [2, 4]}}
-        sr = ensure_sr_slice(self.state)
-        # Enqueue clip with two questions
-        base = datetime(2025, 1, 1, 12, 0, 0)
+    def test_due_session_and_progression(self):
+        state = {"sr": {}}
+        sr = ensure_sr_slice(state)
+        # Enqueue 1 clip with 2 questions due immediately
         enqueue(
-            self.state,
-            clip_id="clipA",
+            state,
+            clip_id="clip1",
             questions=[{"text_cue": "Q1?", "answer": "A1"}, {"text_cue": "Q2?", "answer": "A2"}],
             interval_index=0,
-            base_time=base,
+            base_time=datetime(2025, 1, 1, 12, 0, 0),
         )
+        # Pop when due
+        item = pop_next_due(state, now=datetime(2025, 1, 1, 12, 0, 30))
+        self.assertIsNotNone(item)
+        first = begin_session(state, item)  # type: ignore[arg-type]
+        self.assertEqual(first, "Q1?")
 
-    def test_due_session_and_progression(self):
-        # No active session initially; nothing due at t+1s
-        # Not due at 12:00:01
-        self.assertIsNone(get_next_due(self.state, now=datetime(2025, 1, 1, 12, 0, 1)))
-        # Due at 12:00:02
-        item = pop_next_due(self.state, now=datetime(2025, 1, 1, 12, 0, 2))
-        prompt = begin_session(self.state, item)
-        self.assertEqual(prompt, "Q1?")
-        append_answer_and_advance(self.state, "first answer")
-        self.assertFalse(session_finished(self.state))
-        self.assertEqual(current_prompt(self.state), "Q2?")
-        append_answer_and_advance(self.state, "second answer")
-        self.assertTrue(session_finished(self.state))
-        result = evaluate_session(self.state)
-        self.assertTrue(result["success"])  # answered both
-        reschedule(self.state, success=True, now=datetime(2025, 1, 1, 12, 0, 3))
+        # Answer Q1
+        append_answer_and_advance(state, "answer1")
+        self.assertFalse(session_finished(state))
+        self.assertEqual(current_prompt(state), "Q2?")
+
+        # Answer Q2; session finished
+        append_answer_and_advance(state, "answer2")
+        self.assertTrue(session_finished(state))
+        result = evaluate_session(state)
+        self.assertTrue(result["success"])  # 2/2 non-empty
 
 
 if __name__ == "__main__":

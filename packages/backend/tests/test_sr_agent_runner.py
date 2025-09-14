@@ -5,6 +5,7 @@ import sys
 import unittest
 from datetime import datetime
 import asyncio
+import uuid
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -73,7 +74,7 @@ class TestSRKickoffChat(unittest.IsolatedAsyncioTestCase):
         # Use a unique session ID; rely on SR_FALLBACK_CLIP_IDS to avoid Supabase in test env
         os.environ["SR_FALLBACK_CLIP_IDS"] = "clipX,clipY"
         os.environ["SR_MAX_CLIPS"] = "1"
-        session_id = "test_sr_session_api"
+        session_id = str(uuid.uuid4())
 
         # Kickoff stream should yield at least one part
         received = []
