@@ -70,6 +70,72 @@ class VideoClip:
         except Exception as e:
             raise Exception(f"Error fetching video from Supabase: {str(e)}")
     
+    def get_video_path(self) -> str:
+        """
+        Return the storage path for this video's object in Supabase.
+        """
+        print(f"🔎 [VideoClip:{self.id}] Fetching video_path from Supabase...")
+        response = self.supabase.table('test_videos').select('video_path').eq('id', self.id).single().execute()
+        if not response.data or 'video_path' not in response.data:
+            raise Exception(f"Video with ID {self.id} not found in database")
+        path = response.data['video_path']
+        print(f"✅ [VideoClip:{self.id}] video_path: {path}")
+        return path
+
+    def download_to_tempfile(self, suffix: str = '.mp4') -> str:
+        """
+        Download the video to a temporary file and return the local file path.
+        Caller is responsible for deleting the returned file when done.
+        """
+        video_path = self.get_video_path()
+        print(f"📥 [VideoClip:{self.id}] Downloading from storage path: {video_path}")
+        storage_response = self.supabase.storage.from_('test_videos').download(video_path)
+        if not storage_response:
+            raise Exception(f"Failed to download video from storage path: {video_path}")
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(storage_response)
+            print(f"💾 [VideoClip:{self.id}] Saved temp file: {temp_file.name}")
+            return temp_file.name
+
+    def upload_to_gemini(self, local_path: str):
+        """
+        Upload a local video file to Gemini and wait until processing completes.
+        Returns the uploaded file handle usable as a multimodal part.
+        """
+        print(f"🚀 [VideoClip:{self.id}] Uploading to Gemini: {local_path}")
+        video_file = genai.upload_file(path=local_path, mime_type="video/mp4")
+        import time
+        while getattr(video_file, 'state', None) and getattr(video_file.state, 'name', '') == "PROCESSING":
+            print("⏳ [VideoClip] Gemini processing...")
+            time.sleep(2)
+            video_file = genai.get_file(video_file.name)
+        if getattr(video_file, 'state', None) and getattr(video_file.state, 'name', '') == "FAILED":
+            raise Exception("Video processing failed")
+        try:
+            uri = getattr(video_file, 'uri', None) or getattr(video_file, 'name', None)
+            print(f"✅ [VideoClip:{self.id}] Gemini upload ready: {uri}")
+        except Exception:
+            pass
+        return video_file
+
+    def make_langchain_media_part(self) -> tuple:
+        """
+        Produce a LangChain-compatible media content part for this video.
+
+        Returns a tuple: (media_part_dict, temp_path)
+        Caller is responsible for deleting temp_path when finished.
+        """
+        temp_path = self.download_to_tempfile()
+        with open(temp_path, 'rb') as f:
+            data = f.read()
+        media_part = {
+            "type": "media",
+            "mime_type": "video/mp4",
+            "data": data,
+        }
+        return media_part, temp_path
+    
     def _generate_annotation_with_gemini(self, video_data: bytes) -> str:
         """
         Generate annotation for the video using Gemini 2.0 Flash.
@@ -90,19 +156,9 @@ class VideoClip:
                 temp_video_path = temp_file.name
             
             try:
-                # Upload the video file to Gemini
-                video_file = genai.upload_file(path=temp_video_path, mime_type="video/mp4")
-                
-                # Wait for the file to be processed
-                import time
-                while video_file.state.name == "PROCESSING":
-                    print("Processing video...")
-                    time.sleep(2)
-                    video_file = genai.get_file(video_file.name)
-                
-                if video_file.state.name == "FAILED":
-                    raise Exception("Video processing failed")
-                
+                # Upload the video file to Gemini (reusing upload utility)
+                video_file = self.upload_to_gemini(temp_video_path)
+
                 model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
                 
                 # Craft a concise but detailed prompt for memory assistance
@@ -175,14 +231,24 @@ class VideoClip:
         try:
             print(f"🎬 Starting annotation process for video {self.id}...")
             
-            # Step 1: Fetch video from Supabase
-            print("📥 Fetching video from Supabase...")
-            video_data = self._fetch_video_from_supabase()
-            print(f"✅ Video fetched successfully ({len(video_data)} bytes)")
+            # Step 1: Download video to a temp file
+            print("📥 Downloading video to a temporary file...")
+            temp_video_path = self.download_to_tempfile()
+            print(f"✅ Video downloaded successfully to {temp_video_path}")
             
             # Step 2: Generate annotation with Gemini
             print("🤖 Generating annotation with Gemini 2.5 Flash Lite...")
-            self.annotation = self._generate_annotation_with_gemini(video_data)
+            try:
+                # Read bytes to reuse existing annotation generator
+                with open(temp_video_path, 'rb') as f:
+                    video_bytes = f.read()
+                self.annotation = self._generate_annotation_with_gemini(video_bytes)
+            finally:
+                try:
+                    if os.path.exists(temp_video_path):
+                        os.unlink(temp_video_path)
+                except Exception:
+                    pass
             print("✅ Annotation generated successfully")
             
             # Step 3: Update annotation in Supabase
@@ -204,26 +270,45 @@ def main():
     """
     Example usage of the VideoClip class.
     """
-    # Example usage - replace with actual video ID from your Supabase database
-    video_id = "ade62cd7-3b6c-4e5e-a782-929dab2a2d16"
-    # 
     try:
-        clip = VideoClip(video_id)
-        success = clip.annotate()
-        
-        if success:
-            print(f"Annotation: {clip.get_annotation()}")
-        else:
-            print("Failed to annotate video")
-            
+        # Initialize Supabase client
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not supabase_url or not supabase_service_role_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables are required")
+
+        supabase: Client = create_client(supabase_url, supabase_service_role_key)
+
+        # Fetch all video IDs from the database
+        print("🔎 Fetching video IDs from Supabase...")
+        response = supabase.table('test_videos').select('id').execute()
+        rows = response.data or []
+
+        if not rows:
+            print("No videos found in 'test_videos' table.")
+            return
+
+        print(f"Found {len(rows)} videos. Beginning annotation...")
+
+        # Iterate through each video and annotate
+        for row in rows:
+            video_id = row.get('id')
+            if not video_id:
+                continue
+
+            print(f"\n=== Processing video {video_id} ===")
+            try:
+                clip = VideoClip(video_id)
+                success = clip.annotate()
+                if success:
+                    print(f"✅ Finished annotating video {video_id}")
+                else:
+                    print(f"❌ Failed to annotate video {video_id}")
+            except Exception as e:
+                print(f"❌ Error processing video {video_id}: {e}")
+
     except Exception as e:
         print(f"Error: {e}")
-    
-    print("VideoClip class is ready to use!")
-    print("Example usage:")
-    print("  clip = VideoClip('your-video-uuid')")
-    print("  clip.annotate()")
-    print("  print(clip.get_annotation())")
 
 if __name__ == "__main__":
     main()

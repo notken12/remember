@@ -52,23 +52,26 @@ class ChatSession:
             bool: True if successful, False otherwise
         """
         try:
-            print(f"📤 Saving chat session to Supabase...")
+            print(f"📤 Upserting chat session in Supabase...")
             print(f"   Session ID: {self.id}")
             
-            # Insert the session record into the database
-            response = self.supabase.table('chat_sessions').insert({
-                'id': self.id
-            }).execute()
+            # Upsert the session record into the database (idempotent)
+            # on_conflict ensures 'id' uniqueness; ignore_duplicates avoids touching existing rows
+            response = self.supabase.table('chat_sessions').upsert(
+                {'id': self.id}, on_conflict='id', ignore_duplicates=True
+            ).execute()
             
             if response.data:
                 self.created_at = response.data[0].get('created_at')
-                print(f"✅ Chat session saved successfully to Supabase")
+                print(f"✅ Chat session upserted successfully in Supabase")
                 print(f"   Record ID: {self.id}")
                 print(f"   Created at: {self.created_at}")
                 return True
             else:
-                print(f"❌ Failed to save chat session: {response}")
-                return False
+                # When ignore_duplicates=True and row exists, some drivers return empty data
+                # Treat as success and avoid extra round trips
+                print(f"ℹ️ Chat session already exists (treated as success)")
+                return True
                 
         except Exception as e:
             print(f"❌ Error saving chat session to Supabase: {str(e)}")
