@@ -51,6 +51,102 @@ if TYPE_CHECKING:
 load_dotenv()
 
 
+# ---------------------------------------------------------------------
+# Phase 0: AgentGraphState schema and defaults (LangGraph scaffolding)
+# ---------------------------------------------------------------------
+
+# Typed, JSON-serializable shapes for the state managed by LangGraph.
+try:
+    # Python 3.8+ has TypedDict in typing; prefer it for shape declarations
+    from typing import TypedDict
+except Exception:  # pragma: no cover
+    TypedDict = dict  # type: ignore
+
+
+class QuestionState(TypedDict):
+    """Serializable representation of a cue-based question.
+
+    Keys:
+        text_cue: The question text shown to the user.
+        answer: A short, factual answer aligned with the clip content.
+    """
+
+    text_cue: str
+    answer: str
+
+
+class QueueItemState(TypedDict):
+    """Serializable representation of a scheduled spaced-retrieval item.
+
+    Keys:
+        clip_id: UUID string referencing a video in Supabase.
+        next_at: ISO-8601 timestamp indicating when the item becomes due.
+        interval_index: Index into `sr.interval_seconds` for this schedule.
+        attempt_count: Number of prior attempts during this SR run.
+        questions: Ordered list of `QuestionState` for this clip.
+        meta: Free-form metadata for HUD ranges, scoring traces, etc.
+    """
+
+    clip_id: str
+    next_at: str
+    interval_index: int
+    attempt_count: int
+    questions: List[QuestionState]
+    meta: Dict[str, Any]
+
+
+class ActiveSessionExchange(TypedDict, total=False):
+    """One Q&A exchange inside an active clip session."""
+
+    question: str
+    user: str
+    assessment: str
+
+
+class ActiveSessionState(TypedDict):
+    """Serializable representation of an ongoing clip Q&A session.
+
+    Keys:
+        clip_id: UUID of the clip being reviewed.
+        q_index: Index of the next question to ask (0-based).
+        exchanges: List of completed exchanges for audit and scoring.
+    """
+
+    clip_id: str
+    q_index: int
+    exchanges: List[ActiveSessionExchange]
+
+
+class SRState(TypedDict, total=False):
+    """Top-level SR slice of the graph state."""
+
+    queue: List[QueueItemState]
+    interval_seconds: List[int]
+    clip_questions: Dict[str, List[QuestionState]]
+    selected_clips: List[str]
+    active_session: Optional[ActiveSessionState]
+    last_activity_at: str
+
+
+class ChatState(TypedDict, total=False):
+    """Chat/session slice of the graph state (minimal for SR)."""
+
+    session_id: str
+
+
+class AgentGraphState(TypedDict, total=False):
+    """Complete agent graph state as seen by the LangGraph runtime."""
+
+    sr: SRState
+    chat: ChatState
+
+
+# Default constants for SR configuration
+DEFAULT_INTERVAL_SECONDS: List[int] = [30, 60, 120, 240]
+DEFAULT_QUESTIONS_PER_CLIP: int = 4
+DEFAULT_CANDIDATE_LIMIT: int = 20
+
+
 @dataclass
 class QueueItem:
     """A single scheduled retrieval entry in the priority queue.
