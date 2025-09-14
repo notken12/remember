@@ -30,7 +30,19 @@ class MyMentraOSApp extends AppServer {
 
       // If we have accumulated transcription and an active ESI session, submit it via button
       if (accumulatedTranscription) {
-        if (currentEsiSessionId) {
+        if (wakeWordDetected) {
+          session.logger.info(`Button-submitting accumulated transcription to Assistant chat: ${accumulatedTranscription}`)
+          const chatParams = new URLSearchParams({ user_message: accumulatedTranscription })
+          const chatUrl = process.env.BACKEND_URL + "/assistant_chat?" + chatParams.toString()
+          aiTalking = true
+          const response = await fetch(chatUrl, {
+            method: "POST",
+          })
+          const responseText = await response.text()
+          aiTalking = false
+          session.logger.info(`Accumulated transcription button-submitted to Assistant chat`)
+        }
+        else if (currentEsiSessionId) {
           session.logger.info(`Button-submitting accumulated transcription to ESI session: ${accumulatedTranscription}`)
           const chatParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: accumulatedTranscription })
           const chatUrl = process.env.BACKEND_URL + "/esi_chat?" + chatParams.toString()
@@ -68,17 +80,6 @@ class MyMentraOSApp extends AppServer {
           }
           aiTalking = false
           session.logger.info(`Accumulated transcription button-submitted to SR session`)
-        } else if (wakeWordDetected) {
-          session.logger.info(`Button-submitting accumulated transcription to Assistant chat: ${accumulatedTranscription}`)
-          const chatParams = new URLSearchParams({ user_message: accumulatedTranscription })
-          const chatUrl = process.env.BACKEND_URL + "/assistant_chat?" + chatParams.toString()
-          aiTalking = true
-          const response = await fetch(chatUrl, {
-            method: "POST",
-          })
-          const responseText = await response.text()
-          aiTalking = false
-          session.logger.info(`Accumulated transcription button-submitted to Assistant chat`)
         }
 
         // Clear the accumulated transcription after successful submission
