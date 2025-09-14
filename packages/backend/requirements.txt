@@ -71,6 +71,7 @@ proto-plus==1.26.1
 protobuf==5.29.5
 psycopg==3.2.10
 psycopg-pool==3.2.6
+psycopg-binary==3.2.9
 pyarrow==21.0.0
 pyasn1==0.6.1
 pyasn1_modules==0.4.2

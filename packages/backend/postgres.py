@@ -13,12 +13,14 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.postgres import PostgresSaver
 import time
+import logging
 
 
 class AsyncPostgresSaver(PostgresSaver):
     def __init__(self, conn, pipe=None):
         super().__init__(conn, pipe)
         self._conn_string = None
+        self.logger = logging.getLogger(__name__)
 
     def _create_fresh_connection(self):
         """Create a fresh database connection."""
