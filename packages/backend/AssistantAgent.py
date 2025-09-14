@@ -66,9 +66,44 @@ def select_video(video_uuid: str) -> Dict[str, str]:
     Returns
     -------
     Dict[str, str]
-        Structured directive: {"uuid": <video_uuid>} for downstream handling.
+        Structured directive containing a public URL and related info:
+        {"public_url": <url>, "video_path": <path>, "uuid": <id>}
     """
-    return {"uuid": str(video_uuid)}
+    try:
+        # Fetch storage path from DB
+        resp = supabase.table("videos").select("video_path").eq("id", video_uuid).single().execute()
+        row = (resp.data or {}) if hasattr(resp, "data") else resp
+        video_path = row.get("video_path") if isinstance(row, dict) else None
+        if not video_path:
+            return {"public_url": "", "video_path": "", "uuid": str(video_uuid), "error": "video_path not found"}
+
+        # Try official SDK public URL method
+        public_info = None
+        try:
+            public_info = supabase.storage.from_("videos").get_public_url(video_path)
+        except Exception:
+            public_info = None
+
+        public_url = None
+        if isinstance(public_info, dict):
+            # supabase-py variants
+            public_url = (
+                public_info.get("data", {}).get("publicUrl")
+                or public_info.get("publicUrl")
+                or public_info.get("public_url")
+            )
+
+        # Fallback manual construction
+        if not public_url:
+            base = os.getenv("SUPABASE_URL", "").rstrip("/")
+            if base:
+                public_url = f"{base}/storage/v1/object/public/videos/{video_path}"
+            else:
+                public_url = ""
+
+        return {"public_url": str(public_url)}
+    except Exception as e:
+        return {"public_url": "", "error": str(e)}
 
 
 class AssistantAgent:
