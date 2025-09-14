@@ -7,7 +7,7 @@ interface Video {
     videoURL: string;
     time_created: string;
     title?: string;
-    description?: string;
+    annotation: string;
 }
 
 export default async function AgentPage() {
@@ -22,7 +22,7 @@ export default async function AgentPage() {
 
     return (
         <div className="h-full container mx-auto p-6">
-            <h1 className="scroll-m-20 text-3xl font-semibold tracking-tight mb-8">Memories</h1>
+            <h1 className="scroll-m-20 text-3xl font-semibold tracking-tight mb-6 mt-4">Memories</h1>
             <VideoGrid videos={videos} />
         </div>
     )
