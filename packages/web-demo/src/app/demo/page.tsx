@@ -14,6 +14,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
 import { cn } from '@/lib/utils';
 import Image from 'next/image';
+import { createClient } from '@supabase/supabase-js';
 
 export default function DemoPage() {
     const [messages, setMessages] = useState<UIMessage[]>([])
@@ -154,18 +155,25 @@ export default function DemoPage() {
                                     switch (part.type) {
                                         case "text":
                                             return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        case "tool-select_video":
+                                            return (
+                                                <Video
+                                                    uuid={part.input?.video_uuid}
+                                                    controls
+                                                    autoPlay
+                                                />
+                                            )
                                         case "tool-show_image":
                                             return (
-                                                <video
-                                                    src={part.output?.url}
-                                                    className="max-w-96 max-h-96"
+                                                <Video
+                                                    uuid={part.input?.video_uuid}
                                                     muted
                                                     preload="metadata"
                                                 />
                                             )
                                         case "tool-show_video_slice":
                                             return (
-                                                <VideoSlice url={part.output?.url} start={part.input?.start} end={part.input?.end} />
+                                                <VideoSlice uuid={part.input?.video_uuid} start={part.input?.start} end={part.input?.end} />
                                             )
                                         case "tool-end_esi_session":
                                             return <p>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
@@ -188,11 +196,33 @@ export default function DemoPage() {
     )
 }
 
-function VideoSlice({ url, start, end }: { url: string, start: number, end: number }) {
+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_API_KEY!)
+
+function Video({ uuid, ...restProps }: { uuid: string } & React.ComponentProps<'video'>) {
+    const [url, setUrl] = useState('')
+    useEffect(() => {
+        (async () => {
+            const { data } = await supabase.from('videos').select('video_path').eq("id", uuid).single().throwOnError()
+            setUrl(supabase.storage.from('videos').getPublicUrl(data.video_path).data.publicUrl)
+        })()
+    }, [uuid])
+    return <video src={url}
+        className="max-w-96 max-h-96"
+        {...restProps}
+    />
+}
+
+function VideoSlice({ uuid, start, end }: { uuid: string, start: number, end: number }) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const [isLoaded, setIsLoaded] = useState(false);
+    const [url, setUrl] = useState('')
 
     useEffect(() => {
+        (async () => {
+            const { data } = await supabase.from('videos').select('video_path').eq("id", uuid).single().throwOnError()
+            setUrl(supabase.storage.from('videos').getPublicUrl(data.video_path).data.publicUrl)
+        })()
+
         const video = videoRef.current;
         if (!video) return;
 

@@ -109,17 +109,20 @@ class MyMentraOSApp extends AppServer {
         session.logger.info(`Accumulated transcription: ${accumulatedTranscription}`)
 
         // Check for wake word to start assistant session
-        if (data.text.toLowerCase().includes(WAKE_WORD) && !aiTalking && !wakeWordDetected) {
+        if (data.text.toLowerCase().includes(WAKE_WORD) && !wakeWordDetected) {
           session.logger.info(`Wake word detected, querying Assistant`)
           wakeWordDetected = true
           const searchParams = new URLSearchParams({ user_message: accumulatedTranscription })
           const url = process.env.BACKEND_URL + "/assistant_chat?" + searchParams.toString()
           aiTalking = true
+          accumulatedTranscription = ""
           await fetch(url, {
             method: "POST",
           })
           aiTalking = false
+          wakeWordDetected = false
           session.logger.info(`Assistant query started`)
+          return
         }
       }
 
