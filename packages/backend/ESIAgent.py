@@ -143,31 +143,31 @@ class ESIAgent:
         )
 
         instruction = f"""
-You are an expert clinician facilitating Episodic Specificity Induction (ESI) therapy.
-You are given brief annotations of first-person video clips captured by smart glasses.
+    You are an expert clinician facilitating Episodic Specificity Induction (ESI) therapy.
+    You are given brief annotations of first-person video clips captured by smart glasses.
 
-Your task: Choose up to {max_items} clips that are most conducive to ESI.
+    Your task: Choose up to {max_items} clips that are most conducive to ESI.
 
-Prioritize clips whose annotations indicate:
-- Rich, concrete sensory detail (visual, auditory, tactile, olfactory)
-- Clear spatiotemporal specificity (where and when)
-- Goal-directed or socially interactive moments that can be elaborated
-- Emotionally salient yet safe content (avoid overwhelming distress or trauma)
-- Distinctiveness/variability across clips to cover diverse contexts
+    Prioritize clips whose annotations indicate:
+    - Rich, concrete sensory detail (visual, auditory, tactile, olfactory)
+    - Clear spatiotemporal specificity (where and when)
+    - Goal-directed or socially interactive moments that can be elaborated
+    - Emotionally salient yet safe content (avoid overwhelming distress or trauma)
+    - Distinctiveness/variability across clips to cover diverse contexts
 
-De-emphasize:
-- Vague, generic, or purely factual summaries with little imagery
-- Repetitive scenes with minimal new detail across clips
-- Content that appears unsafe or likely to trigger severe distress
+    De-emphasize:
+    - Vague, generic, or purely factual summaries with little imagery
+    - Repetitive scenes with minimal new detail across clips
+    - Content that appears unsafe or likely to trigger severe distress
 
-Output format requirements (must follow exactly):
-- Return ONLY a JSON array (no extra text, no markdown) where each item is an object:
-  {{"uuid": "<clip_uuid>", "reasoning": "1–2 sentences explaining why this clip is ideal for ESI"}}
-- Keep reasoning concise, focusing on ESI-relevant features (sensory detail, specificity, social/goal relevance, emotional salience, safety).
+    Output format requirements (must follow exactly):
+    - Return ONLY a JSON array (no extra text, no markdown) where each item is an object:
+    {{"uuid": "<clip_uuid>", "reasoning": "1–2 sentences explaining why this clip is ideal for ESI"}}
+    - Keep reasoning concise, focusing on ESI-relevant features (sensory detail, specificity, social/goal relevance, emotional salience, safety).
 
-Here are the candidate clips (JSON):
-{dataset_json}
-"""
+    Here are the candidate clips (JSON):
+    {dataset_json}
+    """
         return instruction
 
     def select_memories(
