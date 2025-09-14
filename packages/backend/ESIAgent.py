@@ -48,7 +48,7 @@ class ESIAgent:
         
         self.gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
         self.model_name: str = "gemini-2.5-flash"
-        self.table_name: str = "test_videos"
+        self.table_name: str = "videos"
         # Default to created_at but permit override via CLI; keep legacy compat
         self.timestamp_column: str = "time_created"
         # Context mode: "video" | "annotation"
@@ -502,7 +502,7 @@ def main() -> None:
         "--model", dest="model_name", default="gemini-2.5-flash", help="Gemini model name"
     )
     parser.add_argument(
-        "--table", dest="table_name", default="test_videos", help="Supabase table holding videos"
+        "--table", dest="table_name", default="videos", help="Supabase table holding videos"
     )
     parser.add_argument(
         "--ts-col", dest="timestamp_column", default="time_created", help="Timestamp column for filtering"

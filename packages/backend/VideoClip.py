@@ -52,7 +52,7 @@ class VideoClip:
         """
         try:
             # First, get the video record from the database to get the video_path
-            response = self.supabase.table('test_videos').select('video_path').eq('id', self.id).single().execute()
+            response = self.supabase.table('videos').select('video_path').eq('id', self.id).single().execute()
             
             if not response.data:
                 raise Exception(f"Video with ID {self.id} not found in database")
@@ -60,7 +60,7 @@ class VideoClip:
             video_path = response.data['video_path']
             
             # Download the video file from storage
-            storage_response = self.supabase.storage.from_('test_videos').download(video_path)
+            storage_response = self.supabase.storage.from_('videos').download(video_path)
             
             if not storage_response:
                 raise Exception(f"Failed to download video from storage path: {video_path}")
@@ -75,7 +75,7 @@ class VideoClip:
         Return the storage path for this video's object in Supabase.
         """
         print(f"🔎 [VideoClip:{self.id}] Fetching video_path from Supabase...")
-        response = self.supabase.table('test_videos').select('video_path').eq('id', self.id).single().execute()
+        response = self.supabase.table('videos').select('video_path').eq('id', self.id).single().execute()
         if not response.data or 'video_path' not in response.data:
             raise Exception(f"Video with ID {self.id} not found in database")
         path = response.data['video_path']
@@ -89,7 +89,7 @@ class VideoClip:
         """
         video_path = self.get_video_path()
         print(f"📥 [VideoClip:{self.id}] Downloading from storage path: {video_path}")
-        storage_response = self.supabase.storage.from_('test_videos').download(video_path)
+        storage_response = self.supabase.storage.from_('videos').download(video_path)
         if not storage_response:
             raise Exception(f"Failed to download video from storage path: {video_path}")
 
@@ -199,9 +199,9 @@ class VideoClip:
         try:
             # Check if annotation column exists, if not we need to add it
             # For now, we'll assume the table structure supports annotations
-            # You may need to add an 'annotation' column to your test_videos table
+            # You may need to add an 'annotation' column to your videos table
             
-            response = self.supabase.table('test_videos').update({
+            response = self.supabase.table('videos').update({
                 'annotation': annotation
             }).eq('id', self.id).execute()
             
@@ -281,11 +281,11 @@ def main():
 
         # Fetch all video IDs from the database
         print("🔎 Fetching video IDs from Supabase...")
-        response = supabase.table('test_videos').select('id').execute()
+        response = supabase.table('videos').select('id').execute()
         rows = response.data or []
 
         if not rows:
-            print("No videos found in 'test_videos' table.")
+            print("No videos found in 'videos' table.")
             return
 
         print(f"Found {len(rows)} videos. Beginning annotation...")
