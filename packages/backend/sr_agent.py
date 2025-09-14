@@ -718,26 +718,31 @@ class SRAgentRunner:
                 _log_sr_error(state, "Failed to prepare media context for selected clips", e)
         sr["media_attached_clips"] = list(selected)
 
-        # Fast-start: immediately start the earliest enqueued item regardless of time
+        # Fast-start vs readiness-gated kickoff (default: readiness-gated)
         first_prompt: Optional[str] = None
-        try:
-            q = sr.get("queue", []) or []
-            earliest_idx: Optional[int] = None
-            earliest_time: Optional[datetime] = None
-            for idx, it in enumerate(q):
-                dt = _parse_iso(it.get("next_at", "")) or now
-                if earliest_time is None or dt < earliest_time:
-                    earliest_time = dt
-                    earliest_idx = idx
-            if earliest_idx is not None:
-                item = q.pop(earliest_idx)
-                sr["queue"] = q
-                first_prompt = begin_session(state, item)
-                set_stage(state, "session_active")
-            else:
+        fast_start_env = (os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"})
+        if fast_start_env:
+            try:
+                q = sr.get("queue", []) or []
+                earliest_idx: Optional[int] = None
+                earliest_time: Optional[datetime] = None
+                for idx, it in enumerate(q):
+                    dt = _parse_iso(it.get("next_at", "")) or now
+                    if earliest_time is None or dt < earliest_time:
+                        earliest_time = dt
+                        earliest_idx = idx
+                if earliest_idx is not None:
+                    item = q.pop(earliest_idx)
+                    sr["queue"] = q
+                    first_prompt = begin_session(state, item)
+                    set_stage(state, "session_active")
+                else:
+                    set_stage(state, "kickoff")
+            except Exception as e:
+                _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
                 set_stage(state, "kickoff")
-        except Exception as e:
-            _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
+        else:
+            # Deterministic kickoff text; wait for user readiness in chat()
             set_stage(state, "kickoff")
 
         # Build streaming payload
@@ -753,7 +758,7 @@ class SRAgentRunner:
             if n == 0:
                 _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
             human_content = [
-                {"type": "text", "text": f"We will practice recall for {n} short clips. Greet briefly and ask if they are ready to begin."},
+                {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
             ]
         # Compose full message list: start fresh for kickoff, attach media once as context
         state["messages"] = [
@@ -837,29 +842,41 @@ class SRAgentRunner:
                     {"type": "text", "text": summary},
                 ]
         else:
-            # No active session; if due, start; else small talk
+            # No active session
             now = datetime.utcnow()
-            due = get_next_due(state, now=now)
-            if due is not None:
-                item = pop_next_due(state, now=now)
-                if item is not None:
-                    prompt = begin_session(state, item)
-                    # Do not reattach media in chat; context exists from kickoff
-                    human_content = [
-                        {"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"},
-                    ]
+            user_text_norm = (user_message or "").strip().lower()
+            if get_stage(state) == "kickoff":
+                # Gate on readiness
+                if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"}:
+                    # Start earliest item now
+                    q = sr.get("queue", []) or []
+                    if q:
+                        item = q.pop(0)
+                        sr["queue"] = q
+                        prompt = begin_session(state, item)
+                        set_stage(state, "session_active")
+                        human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
+                    else:
+                        human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
                 else:
-                    human_content = [
-                        {"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."},
-                    ]
+                    human_content = [{"type": "text", "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'."}]
             else:
-                # Small talk / waiting
-                user_text_norm = (user_message or "").strip().lower()
-                if user_text_norm in {"begin", "start", "next", "go", "ready"}:
-                    msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
+                # Non-kickoff idle path: due check or small talk
+                due = get_next_due(state, now=now)
+                if due is not None:
+                    item = pop_next_due(state, now=now)
+                    if item is not None:
+                        prompt = begin_session(state, item)
+                        set_stage(state, "session_active")
+                        human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
+                    else:
+                        human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
                 else:
-                    msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
-                human_content = [{"type": "text", "text": msg}]
+                    if user_text_norm in {"begin", "start", "next", "go", "ready"}:
+                        msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
+                    else:
+                        msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
+                    human_content = [{"type": "text", "text": msg}]
 
         # Append control instruction only; do not re-add system prompts on chat turns
         state["messages"] = prior_messages + [
@@ -876,21 +893,37 @@ async def main():
     """CLI for SR Agent runner (kickoff/chat/interactive)."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="SR Agent with LangGraph")
+    parser = argparse.ArgumentParser(description="SR Agent (kickoff once, then chat)")
     parser.add_argument("--session-id", help="Session ID for conversation persistence")
-    parser.add_argument("--chat", help="Single message to send")
-    parser.add_argument("--interactive", action="store_true", default=True, help="Interactive chat mode")
+    parser.add_argument("--chat", help="Send a single chat message (assumes kickoff already run)")
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=True,
+        help="Interactive mode: runs kickoff, then loops over chat inputs",
+    )
+    parser.add_argument(
+        "--no-interactive",
+        dest="interactive",
+        action="store_false",
+        help="Disable interactive mode",
+    )
     args = parser.parse_args()
 
     session_id = args.session_id or str(uuid.uuid4())
     runner = SRAgentRunner(session_id=session_id)
     print(f"Session ID: {session_id}")
+    fast = os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"}
+    mode = "FAST-START" if fast else "READINESS-GATED"
+    print(f"Kickoff mode: {mode}")
 
     if args.chat:
         async for part in runner.chat(args.chat):
             print("Coach:", part)
     elif args.interactive:
         print("Starting SR session...")
+        print("- Kickoff will "+("start immediately with the first question." if fast else "ask if you're ready first."))
+        print("- Type your responses. To start after readiness prompt, type 'ready'. Ctrl+C to quit.")
         try:
             async for part in runner.kickoff():
                 print("Coach:", part)
