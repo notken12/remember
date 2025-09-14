@@ -10,46 +10,50 @@ BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if BACKEND_DIR not in sys.path:
     sys.path.append(BACKEND_DIR)
 
-from SRAgent import SRAgent, AgentGraphState
-from Question import Question
+from sr_agent import (
+    ensure_sr_slice,
+    enqueue,
+    get_next_due,
+    pop_next_due,
+    begin_session,
+    current_prompt,
+    append_answer_and_advance,
+    session_finished,
+    evaluate_session,
+    reschedule,
+)
 
 
 class TestChatFlow(unittest.TestCase):
     def setUp(self):
-        self.agent = SRAgent(interval_seconds=[2, 4], questions_per_clip=2)
-        self.agent.set_graph_state({"sr": {}})  # type: ignore
-
-        # Seed a selected clip and questions
-        self.agent._selected_clips = ["clipA"]
-        self.agent._clip_questions = {
-            "clipA": [
-                Question(video_clip=None, text_cue="Q1?", answer="A1"),
-                Question(video_clip=None, text_cue="Q2?", answer="A2"),
-            ]
-        }
+        self.state = {"sr": {"interval_seconds": [2, 4]}}
+        sr = ensure_sr_slice(self.state)
+        # Enqueue clip with two questions
         base = datetime(2025, 1, 1, 12, 0, 0)
-        self.agent.enqueue_clip_for_spaced_retrieval(
-            "clipA", self.agent._clip_questions["clipA"], interval_index=0, base_time=base
+        enqueue(
+            self.state,
+            clip_id="clipA",
+            questions=[{"text_cue": "Q1?", "answer": "A1"}, {"text_cue": "Q2?", "answer": "A2"}],
+            interval_index=0,
+            base_time=base,
         )
 
     def test_due_session_and_progression(self):
         # No active session initially; nothing due at t+1s
-        msg_idle = self.agent.chat("hi")
-        self.assertTrue(isinstance(msg_idle, str))
-
-        # At t+2s, should start session
-        start_msg = self.agent.conduct_clip_session(
-            self.agent.pop_next_due_item(now=datetime(2025, 1, 1, 12, 0, 2))  # type: ignore
-        )
-        self.assertIn("Let's focus on this moment", start_msg)
-
-        # First answer advances q_index and returns next prompt
-        reply = self.agent.chat("first answer")
-        self.assertIn("Next one:", reply)
-
-        # Second answer concludes and reschedules
-        reply2 = self.agent.chat("second answer")
-        self.assertIn("circle back", reply2)
+        # Not due at 12:00:01
+        self.assertIsNone(get_next_due(self.state, now=datetime(2025, 1, 1, 12, 0, 1)))
+        # Due at 12:00:02
+        item = pop_next_due(self.state, now=datetime(2025, 1, 1, 12, 0, 2))
+        prompt = begin_session(self.state, item)
+        self.assertEqual(prompt, "Q1?")
+        append_answer_and_advance(self.state, "first answer")
+        self.assertFalse(session_finished(self.state))
+        self.assertEqual(current_prompt(self.state), "Q2?")
+        append_answer_and_advance(self.state, "second answer")
+        self.assertTrue(session_finished(self.state))
+        result = evaluate_session(self.state)
+        self.assertTrue(result["success"])  # answered both
+        reschedule(self.state, success=True, now=datetime(2025, 1, 1, 12, 0, 3))
 
 
 if __name__ == "__main__":
