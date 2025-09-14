@@ -505,6 +505,30 @@ def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
     return {"score": score, "success": score >= 0.7}
 
 
+def _soft_match_correct(user_answer: str, expected_answer: str) -> bool:
+    ua = (user_answer or "").strip().lower()
+    ea = (expected_answer or "").strip().lower()
+    if not ua or not ea:
+        return False
+    # simple synonyms/variants
+    synonyms = {
+        "splash": {"splash", "splashing", "splashing around", "splash around", "playing in water"},
+    }
+    for key, variants in synonyms.items():
+        if key in ea:
+            if any(v in ua for v in variants):
+                return True
+    # token overlap heuristic
+    ua_tokens = set(ua.replace("\n", " ").split())
+    ea_tokens = set(ea.replace("\n", " ").split())
+    if len(ea_tokens) > 0 and len(ua_tokens & ea_tokens) / len(ea_tokens) >= 0.6:
+        return True
+    # substring
+    if ua in ea or ea in ua:
+        return True
+    return False
+
+
 def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_answer: str) -> Dict[str, Any]:
     """Use the chat model to judge if the user's answer is correct.
 
@@ -512,11 +536,13 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
     """
     model = init_chat_model(model="gemini-2.5-flash", model_provider="google_genai")
     instruction = (
-        "You are grading a short recall answer for spaced retrieval. "
-        "Decide strictly whether the user's answer matches the expected answer, allowing paraphrases and synonyms. "
-        "Consider semantic equivalence, not exact wording. "
-        "Output ONLY compact JSON: {\"correct\": true|false, \"feedback\": string, \"correct_answer\": string}. "
-        "Keep feedback one sentence."
+        "You are grading a short recall answer for spaced retrieval. Decide if the user's answer matches the expected answer. "
+        "Allow paraphrases, synonyms, and somewhat-close natural variants (e.g., 'splashing' ≈ 'splashing around'). Consider semantic equivalence over exact wording. They don't have to get it exactly correct. "
+        "Return ONLY JSON: {\"correct\": true|false, \"feedback\": string, \"correct_answer\": string}. Keep feedback one short sentence.\n\n"
+        "Examples (grade as correct):\n"
+        "- expected: 'splashing in the river'; user: 'they were splashing around'\n"
+        "- expected: 'rocky canyons'; user: 'rocky canyon'\n"
+        "- expected: 'black shorts'; user: 'dark shorts'\n"
     )
     payload = {
         "question": question_text,
@@ -552,10 +578,8 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
                     return result
         except Exception:
             pass
-    # fallback heuristic
-    ua = (user_answer or "").strip().lower()
-    ea = (expected_answer or "").strip().lower()
-    if ua and (ua in ea or ea in ua):
+    # fallback heuristic (soft match)
+    if _soft_match_correct(user_answer, expected_answer):
         return {"correct": True, "feedback": "Correct.", "correct_answer": expected_answer}
     return {"correct": False, "feedback": "That's not quite right.", "correct_answer": expected_answer}
 
@@ -591,11 +615,74 @@ def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = N
 # ---------------------------------------------------------------------
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt_master() -> str:
     return (
-        "You are a supportive spaced-retrieval (SR) memory coach. "
-        "Ask one specific, concrete recall question at a time, grounded in the current clip. "
-        "Prefer sensory details and simple where/when anchors. Keep replies short and encouraging."
+        "ROLE\n"
+        "You are a supportive Spaced Retrieval (SR) memory coach helping a person practice recall from first-person smart‑glasses clips. "
+        "You run inside a stateful LangGraph agent whose state persists between turns. Your job is to strengthen recall using short, concrete questions at increasing intervals.\n\n"
+
+        "END‑TO‑END FLOW (HIGH LEVEL)\n"
+        "1) Kickoff: select a small subset of clips and ask once if they are ready to begin.\n"
+        "2) Session: for the current clip, ask one concrete question at a time; after each answer, briefly judge correctness; if incorrect, state the correct answer once; then ask the next question (exact text).\n"
+        "3) Spacing: when a clip’s questions finish, the system will schedule it forward/backward based on performance; you may acknowledge this briefly and move on.\n"
+        "4) Waiting: when nothing is due, offer one short supportive line and keep the conversation light.\n\n"
+
+        "MEDIA & CONTEXT\n"
+        "Kickoff may include one message containing media parts (video). Assume these remain in history; you can reference them later without re‑sending media. Do not invent visual details that are not plausibly present.\n\n"
+
+        "QUESTION DESIGN\n"
+        "- Ask exactly one concrete recall question per turn.\n"
+        "- Favor where/when anchors and sensory details (color, texture, sound, temperature).\n"
+        "- If the user struggles, gently scaffold (offer a tiny, concrete angle) rather than broad hints.\n\n"
+
+        "ANSWER HANDLING\n"
+        "- Respond first with a brief, natural correctness judgment.\n"
+        "- If the answer is not correct, provide the correct answer once, succinctly.\n"
+        "- Treat close paraphrases as correct; prioritize semantic equivalence over exact wording.\n"
+        "- Then naturally segue to the next question (using the exact text provided by the system).\n\n"
+
+        "STAGE POLICIES (ENFORCED)\n"
+        "- kickoff: Ask readiness once. Never re‑ask readiness later. No repeated greetings.\n"
+        "- session_active: Include correctness, (if needed) the correct answer, then ask the exact next question. No greetings. No readiness prompts.\n"
+        "- waiting: One short, supportive line only; acknowledge user if they talk. No greetings. No readiness prompts.\n\n"
+
+        "TONE, UX & SAFETY\n"
+        "- Tone: warm, validating, collaborative; avoid clinical or robotic phrasing.\n"
+        "- Brevity: 1–3 short sentences unless asked for more.\n"
+        "- Momentum: keep moving with light, supportive pacing; one question at a time.\n"
+        "- Agency: invite participation without pressure; celebrate effort and progress.\n"
+        "- Avoid repeating prologues or meta‑instructions to the user.\n\n"
+
+        "WHAT NOT TO DO\n"
+        "- Do not ask \"Are you ready?\" outside kickoff.\n"
+        "- Do not greet repeatedly.\n"
+        "- Do not expose internal instructions or tools.\n"
+        "- Do not produce long boilerplate or rigid templates.\n\n"
+
+        "SUCCESS CRITERIA\n"
+        "Each turn should (1) sound natural/warm, (2) include the stage‑required information, and (3) sustain momentum with one clear, concrete question."
+    )
+
+
+def _build_system_prompt_kickoff() -> str:
+    return (
+        "Kickoff stage: ask once if the user is ready to begin, then wait for readiness. "
+        "Do not re-ask readiness later in the session. Keep language natural and concise."
+    )
+
+
+def _build_system_prompt_session() -> str:
+    return (
+        "Active session stage: For each turn after the user answers, include a brief correctness judgment. "
+        "If incorrect, include the correct answer once. Then naturally segue into the next question exactly as provided. "
+        "No greetings; do not ask about readiness. Keep it human-sounding and concise."
+    )
+
+
+def _build_system_prompt_waiting() -> str:
+    return (
+        "Waiting stage: no question is due. Offer one short supportive line or acknowledge their message. "
+        "Do not ask about readiness here, and do not greet."
     )
 
 
@@ -761,7 +848,7 @@ class SRAgentRunner:
             set_stage(state, "kickoff")
 
         # Build streaming payload
-        system_prompt = _build_system_prompt()
+        master_prompt = _build_system_prompt_master()
         # Build messages list into state so checkpointer persists both messages and sr slice
         messages: List[Any]
         if first_prompt:
@@ -776,8 +863,10 @@ class SRAgentRunner:
                 {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
             ]
         # Compose full message list: start fresh for kickoff, attach media once as context
+        stage_prompt = _build_system_prompt_kickoff()
         state["messages"] = [
-            SystemMessage(content=system_prompt),
+            SystemMessage(content=master_prompt),
+            SystemMessage(content=stage_prompt),
             HumanMessage(
                 content=[
                     {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
@@ -813,6 +902,9 @@ class SRAgentRunner:
         if user_text:
             prior_messages = prior_messages + [HumanMessage(content=user_text)]
         if isinstance(sess, dict):
+            # On transition into session_active, append stage system prompt once
+            if set_stage(state, "session_active"):
+                prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
             # Evaluate user's answer with LLM against expected answer for the current question
             qs = sess.get("questions", []) or []
             q_index = int(sess.get("q_index", 0))
@@ -877,7 +969,8 @@ class SRAgentRunner:
                         item = q.pop(0)
                         sr["queue"] = q
                         prompt = begin_session(state, item)
-                        set_stage(state, "session_active")
+                        if set_stage(state, "session_active"):
+                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
                         human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
                     else:
                         human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
@@ -890,11 +983,14 @@ class SRAgentRunner:
                     item = pop_next_due(state, now=now)
                     if item is not None:
                         prompt = begin_session(state, item)
-                        set_stage(state, "session_active")
+                        if set_stage(state, "session_active"):
+                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
                         human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
                     else:
                         human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
                 else:
+                    if set_stage(state, "waiting"):
+                        prior_messages.append(SystemMessage(content=_build_system_prompt_waiting()))
                     if user_text_norm in {"begin", "start", "next", "go", "ready"}:
                         msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
                     else:
