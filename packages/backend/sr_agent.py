@@ -114,6 +114,7 @@ class SRState(TypedDict, total=False):
     interval_seconds: List[int]
     questions_per_clip: int
     candidate_limit: int
+    max_clips: int
     selected_clips: List[str]
     enqueued_clips: List[str]
     clip_questions: Dict[str, List[QuestionState]]
@@ -200,6 +201,8 @@ def configure_sr_from_env(state: Dict[str, Any]) -> None:
 
     sr["questions_per_clip"] = _parse_int_env("SR_QUESTIONS_PER_CLIP", sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP))
     sr["candidate_limit"] = _parse_int_env("SR_CANDIDATE_LIMIT", sr.get("candidate_limit", DEFAULT_CANDIDATE_LIMIT))
+    # number of clips per SR run
+    sr["max_clips"] = _parse_int_env("SR_MAX_CLIPS", int(sr.get("max_clips", 3)))
 
     # Video source configuration is read where discovery is performed; export defaults via env
     sr.setdefault("video_table", os.getenv("SR_VIDEO_TABLE", DEFAULT_VIDEO_TABLE))
@@ -518,8 +521,14 @@ class SRAgentRunner:
 
         # Discover and select
         candidates = load_recent_video_ids(state)
+        if not candidates:
+            # Fallback: use SR_FALLBACK_CLIP_IDS if provided for offline/dev
+            fb = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
+            if fb:
+                candidates = _dedupe_preserve_order([cid.strip() for cid in fb.split(",") if cid.strip()])
         sr = ensure_sr_slice(state)
-        selected = select_first_n(candidates, n=3)
+        max_clips = int(sr.get("max_clips", 3))
+        selected = select_first_n(candidates, n=max_clips)
         sr["selected_clips"] = list(selected)
         sr["enqueued_clips"] = []
 
