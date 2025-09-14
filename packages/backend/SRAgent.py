@@ -326,6 +326,8 @@ class SRAgent:
             "created_at",
             "inserted_at",
         ]
+        # LangGraph AgentGraphState reference (set by orchestrator per-turn)
+        self.graph_state: Optional[AgentGraphState] = None
 
     # ---------------------------------------------------------------------
     # Clip discovery (Supabase) and deterministic selection
@@ -1057,6 +1059,14 @@ class SRAgent:
     # Persistence helpers (Supabase-backed session and SR state)
     # ---------------------------------------------------------------------
 
+    def set_graph_state(self, state: AgentGraphState) -> None:
+        """Attach the per-turn AgentGraphState reference provided by LangGraph.
+
+        This must be called by the orchestrator at the start of each turn so
+        that `load_sr_state` and `save_sr_state` can read/write the SR slice.
+        """
+        self.graph_state = state
+
     def ensure_session_saved(self) -> None:
         """Ensure session scaffolding exists (LangGraph environments may no-op).
 
@@ -1086,8 +1096,79 @@ class SRAgent:
 
         Implementations should ensure safety if keys are missing.
         """
-        # This method will be completed when the AgentGraphState instance is
-        # passed into SRAgent. For now, leave logic to phase-2/3 integration.
+        state = getattr(self, "graph_state", None)
+        if not state:
+            return
+        sr: SRState = state.get("sr", {})  # type: ignore[assignment]
+
+        # interval_seconds
+        intervals = sr.get("interval_seconds")
+        if isinstance(intervals, list) and all(isinstance(x, int) for x in intervals):
+            self._interval_seconds = list(intervals)
+
+        # selected_clips
+        sel = sr.get("selected_clips")
+        if isinstance(sel, list):
+            self._selected_clips = [str(x) for x in sel if x]
+
+        # clip_questions cache
+        cq = sr.get("clip_questions", {}) or {}
+        clip_questions: Dict[str, List[Question]] = {}
+        if isinstance(cq, dict):
+            for cid, items in cq.items():
+                qlist: List[Question] = []
+                if isinstance(items, list):
+                    for it in items:
+                        try:
+                            text_cue = str(it.get("text_cue", ""))
+                            answer = str(it.get("answer", ""))
+                        except Exception:
+                            text_cue = ""
+                            answer = ""
+                        qlist.append(Question(video_clip=None, text_cue=text_cue, answer=answer))
+                clip_questions[str(cid)] = qlist
+        self._clip_questions = clip_questions
+
+        # queue (rebuild heap)
+        self._heap = []
+        self._heap_seq = 0
+        queue_state = sr.get("queue", []) or []
+        if isinstance(queue_state, list):
+            for qi in queue_state:
+                if not isinstance(qi, dict):
+                    continue
+                try:
+                    item = QueueItem.from_state(qi)
+                except Exception:
+                    continue
+                self._heap_seq += 1
+                heapq.heappush(self._heap, (item.next_at, self._heap_seq, item))
+
+        # active_session (store as-is; should already be JSON-safe)
+        active = sr.get("active_session")
+        if isinstance(active, dict):
+            self._active_session = {
+                "clip_id": str(active.get("clip_id", "")),
+                "q_index": int(active.get("q_index", 0)),
+                "exchanges": list(active.get("exchanges", [])) if isinstance(active.get("exchanges", []), list) else [],
+                "interval_index": int(active.get("interval_index", 0)),
+                "questions": list(active.get("questions", [])) if isinstance(active.get("questions", []), list) else [],
+            }
+        else:
+            self._active_session = None
+
+        # last_activity_at
+        last = sr.get("last_activity_at")
+        if isinstance(last, str) and last:
+            try:
+                dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                if getattr(dt, "tzinfo", None) is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                self._last_activity_at = dt
+            except Exception:
+                self._last_activity_at = None
+        else:
+            self._last_activity_at = None
         return
 
     def save_sr_state(self) -> None:
@@ -1106,8 +1187,45 @@ class SRAgent:
             - sr.active_session
             - sr.last_activity_at (ISO timestamp)
         """
-        # This method will be completed when we accept an AgentGraphState
-        # instance in the public API and can write into it. Left for next phase.
+        state = getattr(self, "graph_state", None)
+        if not state:
+            return
+
+        # Ensure sr container exists
+        sr: SRState = state.get("sr", {})  # type: ignore[assignment]
+
+        # interval_seconds
+        sr["interval_seconds"] = list(self._interval_seconds)
+
+        # selected_clips
+        sr["selected_clips"] = list(self._selected_clips)
+
+        # clip_questions -> serialize
+        clip_questions_state: Dict[str, List[QuestionState]] = {}
+        for cid, qlist in self._clip_questions.items():
+            clip_questions_state[cid] = [
+                {"text_cue": q.text_cue, "answer": q.answer}
+                for q in (qlist or [])
+            ]
+        sr["clip_questions"] = clip_questions_state
+
+        # queue -> serialize current heap items
+        queue_items: List[QueueItemState] = []
+        for next_at, seq, item in list(self._heap):
+            _ = seq  # unused in serialization
+            queue_items.append(item.to_state())
+        sr["queue"] = queue_items
+
+        # active_session (already JSON-safe)
+        sr["active_session"] = self._active_session if self._active_session else None
+
+        # last_activity_at
+        if self._last_activity_at:
+            sr["last_activity_at"] = self._last_activity_at.isoformat()
+
+        # Write back to graph_state
+        state["sr"] = sr
+        self.graph_state = state
         return
 
     def save_turn_messages(self, user_text: str, assistant_text: str) -> None:
