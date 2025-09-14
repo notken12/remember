@@ -30,7 +30,7 @@ class MyMentraOSApp extends AppServer {
 
       // If we have accumulated transcription and an active ESI session, submit it via button
       if (accumulatedTranscription) {
-        if (wakeWordDetected) {
+        if (wakeWordDetected || accumulatedTranscription.toLowerCase().includes(WAKE_WORD)) {
           session.logger.info(`Button-submitting accumulated transcription to Assistant chat: ${accumulatedTranscription}`)
           const chatParams = new URLSearchParams({ user_message: accumulatedTranscription })
           const chatUrl = process.env.BACKEND_URL + "/assistant_chat?" + chatParams.toString()
