@@ -13,12 +13,14 @@ if (!BACKEND_URL) {
 interface SessionState {
     esiSessionId: string | null
     srSessionId: string | null
+    assistantSessionId: string | null
 }
 
 class RememberCLI {
     private sessionState: SessionState = {
         esiSessionId: null,
-        srSessionId: null
+        srSessionId: null,
+        assistantSessionId: null
     }
 
     async startEsiSession(): Promise<string> {
@@ -128,6 +130,30 @@ class RememberCLI {
         }
     }
 
+    async chatWithAssistantSession(sessionId: string, message: string): Promise<string> {
+        const chatParams = new URLSearchParams({
+            session_id: sessionId,
+            user_message: message
+        })
+        const chatUrl = `${BACKEND_URL}/assistant_chat?${chatParams.toString()}`
+
+        console.log(`💬 Sending message to Assistant session: "${message}"`)
+
+        try {
+            const response = await fetch(chatUrl, { method: "POST" })
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`)
+            }
+
+            const responseText = await response.text()
+            console.log(`🤖 Assistant Response: ${responseText}`)
+            return responseText
+        } catch (error) {
+            console.error("❌ Failed to chat with Assistant:", error)
+            throw error
+        }
+    }
+
     async chatWithAssistant(message: string): Promise<string> {
         const chatParams = new URLSearchParams({ user_message: message })
         const chatUrl = `${BACKEND_URL}/assistant_chat?${chatParams.toString()}`
@@ -169,6 +195,7 @@ class RememberCLI {
         console.log("\n📊 Current Session Status:")
         console.log(`ESI Session: ${this.sessionState.esiSessionId || "None"}`)
         console.log(`SR Session: ${this.sessionState.srSessionId || "None"}`)
+        console.log(`Assistant Session: ${this.sessionState.assistantSessionId || "None"}`)
     }
 
     printHelp(): void {
@@ -180,7 +207,8 @@ Commands:
   esi chat <message>           Send a message to the current ESI session
   sr start                     Start a new SR (Spaced Retrieval) session  
   sr chat <message>            Send a message to the current SR session
-  assistant <message>          Chat directly with the assistant
+  assistant chat <message>     Send a message to the current Assistant session
+  assistant <message>          Chat directly with the assistant (no session)
   transcription <text>         Send transcription text to backend
   status                       Show current session status
   interactive                  Start interactive mode
@@ -190,7 +218,8 @@ Commands:
 Examples:
   remember esi start
   remember esi chat "Tell me about your childhood"
-  remember assistant "What did we discuss yesterday?"
+  remember assistant chat "What did we discuss yesterday?"
+  remember assistant "Quick question without session"
   remember interactive
 
 Environment Variables:
@@ -276,18 +305,32 @@ Environment Variables:
                 break
 
             case 'assistant':
-                const assistantMessage = [subcommand, ...rest].join(' ')
-                if (!assistantMessage) {
-                    console.log("❌ Please provide a message for the assistant")
-                    return
-                }
+                if (subcommand === 'chat') {
+                    const message = rest.join(' ')
+                    if (!message) {
+                        console.log("❌ Please provide a message to send")
+                        return
+                    }
+                    if (!this.sessionState.assistantSessionId) {
+                        console.log("⚠️  No active Assistant session. Starting one...")
+                        this.sessionState.assistantSessionId = randomUUID().toString()
+                    }
+                    await this.chatWithAssistantSession(this.sessionState.assistantSessionId!, message)
+                } else {
+                    // Backwards compatibility: treat any other subcommand as a direct message
+                    const assistantMessage = [subcommand, ...rest].join(' ')
+                    if (!assistantMessage) {
+                        console.log("❌ Please provide a message for the assistant")
+                        return
+                    }
 
-                // Check for wake word
-                if (assistantMessage.toLowerCase().includes(WAKE_WORD)) {
-                    console.log(`🎯 Wake word "${WAKE_WORD}" detected!`)
-                }
+                    // Check for wake word
+                    if (assistantMessage.toLowerCase().includes(WAKE_WORD)) {
+                        console.log(`🎯 Wake word "${WAKE_WORD}" detected!`)
+                    }
 
-                await this.chatWithAssistant(assistantMessage)
+                    await this.chatWithAssistant(assistantMessage)
+                }
                 break
 
             case 'transcription':
