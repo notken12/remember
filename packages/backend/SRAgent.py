@@ -95,8 +95,11 @@ class SRAgent:
     """Spaced Retrieval therapy agent interface and state container.
 
     Responsibilities:
-        - Accept the hand-off from a completed ESI selection step
-          (typically: a set of clip UUIDs or memory objects).
+        - Initialize from Supabase after a prior ESI step has completed. The
+          SR agent does NOT receive data directly from the ESI agent and is
+          NOT called by the ESI agent. Instead, a client/user triggers SR
+          kickoff after ESI finishes, and SRAgent reads any needed inputs
+          (e.g., selected clip UUIDs and metadata) from Supabase.
         - Prepare or fetch cue-based recall questions per clip via
           `SRQuestionGenerator.QuestionGenerator`.
         - Maintain a priority queue of recall tasks, scheduled per spaced
@@ -151,35 +154,36 @@ class SRAgent:
     def kickoff(
         self,
         *,
-        selected_clip_ids: Optional[List[str]] = None,
-        selected_memories: Optional[List[Dict[str, Any]]] = None,
         hardcoded_subset_size: int = 3,
     ) -> str:
         """Initialize an SR run and return deterministic starting text.
 
-        This method is invoked once immediately after the ESI pipeline
-        completes. It should perform initial setup work and return a fixed,
+        Invocation contract:
+            - Called by the client/user AFTER an ESI pipeline has completed.
+            - The ESI agent does not call this directly and no ESI outputs are
+              passed as function parameters. Instead, this method must LOAD
+              any required inputs from Supabase (e.g., selected clip IDs,
+              annotations, or references).
+
+        It should perform all necessary setup work and return a fixed,
         deterministic string suitable for the first assistant message. The
         string should not depend on model randomness.
 
         Behavior (to implement):
             1) Ensure the chat session record exists in Supabase (idempotent).
-            2) Decide which clips will be used during this SR run:
-               - If `selected_clip_ids` is provided, use them directly.
-               - Else, if `selected_memories` is provided, extract their UUIDs.
-               - Else, load a hardcoded subset for early testing.
+            2) Query Supabase to retrieve the authoritative inputs (e.g., list of selected clip UUIDs and any
+               clip metadata required for SR). If no such data is found, fall
+               back to a small, hardcoded subset for development/testing using
+               `hardcoded_subset_size`.
             3) For the chosen clips, pre-generate cue-based questions using
                `QuestionGenerator` (respecting `questions_per_clip`).
             4) Enqueue each clip for its first review at interval index 0.
-            5) Persist the SR scheduling state to Supabase.
+            5) Persist the SR scheduling state to Supabase BEFORE returning so
+               that subsequent chat turns can resume from the saved state.
 
         Args:
-            selected_clip_ids: Optional explicit list of clip UUIDs to use.
-            selected_memories: Optional memory dicts (e.g., from ESI) containing
-                `uuid` and possibly `annotation`. If both are given, the clip
-                IDs take precedence.
-            hardcoded_subset_size: Fallback number of clips to select if neither
-                argument is provided.
+            hardcoded_subset_size: Fallback number of clips to select if the
+                expected Supabase inputs are missing or incomplete.
 
         Returns:
             A deterministic, human-friendly kickoff string such as:
@@ -187,6 +191,8 @@ class SRAgent:
 
         Notes:
             - Do not perform any model inference here, to preserve determinism.
+            - This method is responsible for loading inputs from Supabase and
+              saving the initial SR state back to Supabase before returning.
             - Streaming of this response, if needed, is the responsibility of
               higher layers. This method returns the full text.
         """
