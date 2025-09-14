@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime
 from typing import (
+    Annotated,
     Any,
     Dict,
     List,
@@ -16,12 +17,15 @@ from typing import (
 )
 import uuid
 from dotenv import load_dotenv
+from agent_state import State, get_state_from_supabase
 
 # LangGraph and LangChain imports
+from langgraph.graph import END, START, StateGraph
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent, tools_condition
+from chat.ChatSession import ChatSession
 from postgres import AsyncPostgresSaver
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
@@ -213,118 +217,112 @@ Here are the candidate clips (JSON):
     return results[:max_items]
 
 
-class ESIAgent:
-    """
-    Simplified ESI Agent using LangGraph ReAct agents for memory extraction and therapy.
-    Uses AsyncPostgresSaver for automatic session management.
-    """
+def agent(state: State) -> State:
+    llm = init_chat_model(
+        model="gemini-2.5-flash",
+        model_provider="google_genai",
+    )
+    # LLM expects a list of messages, not the entire state
+    message = llm.invoke(state["messages"])
+    state["messages"].append(message)
+    print(message)
+    supabase.table("chat_messages").insert(
+        {
+            "role": "assistant",
+            "data": message.__dict__,
+            "session_id": str(state["session_id"]),  # Ensure session_id is string
+        }
+    ).execute()
+    return state
 
-    def __init__(self, session_id: Optional[str] = None):
-        # Environment setup
-        self.database_url = os.getenv("DATABASE_URL", "")
 
-        if not all(
-            [
-                self.database_url,
-            ]
-        ):
-            raise ValueError(
-                "Required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL"
-            )
+def tools(state: State) -> State:
+    node = ToolNode(tools=[])
+    tool_calls = node.invoke(state)
+    state["messages"].extend(tool_calls)
+    for tool_call in tool_calls:
+        supabase.table("chat_messages").insert(
+            {
+                "role": "tool",
+                "data": tool_call.__dict__,
+                "session_id": str(state["session_id"]),  # Ensure session_id is string
+            }
+        ).execute()
+    return state
 
-        # Initialize clients
 
-        # Session configuration
-        self.session_id = session_id or f"esi_session_{datetime.now().isoformat()}"
-        self.config = {"configurable": {"thread_id": self.session_id}}
+graph_builder = StateGraph(State)
+graph_builder.add_node("agent", agent)
+graph_builder.add_node("tools", tools)
+graph_builder.add_edge(START, "agent")
+graph_builder.add_conditional_edges("agent", tools_condition)
+graph_builder.add_edge("tools", "agent")
+graph = graph_builder.compile()
 
-        # Memory context
-        self.selected_memories: List[Dict[str, Any]] = []
 
-        # Initialize checkpointer and agent once to avoid prepared statement conflicts
-        self._checkpointer = None
-        self._agent = None
-        self._initialize_agent()
+async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
+    """Start the therapy session with therapist speaking first."""
+    system_prompt = _build_system_prompt()
 
-    def _initialize_agent(self):
-        """Initialize the checkpointer and agent once for the session."""
-        if self._checkpointer is None:
-            # Create a single connection that will be reused
-            from psycopg import Connection
-            from psycopg.rows import dict_row
+    kickoff_message = "Finally, greet the patient warmly and ask ONE gentle, concrete recall question based on the prepared memories."
 
-            conn = Connection.connect(
-                self.database_url,
-                autocommit=True,
-                prepare_threshold=0,  # Disable prepared statements
-                row_factory=dict_row,
-                connect_timeout=30,
-                options="-c statement_timeout=300000",
-            )
-            self._checkpointer = AsyncPostgresSaver(conn, None)
-            self._checkpointer._conn_string = self.database_url
+    print("Extracting memories...")
+    video_media_parts = extract_memories()
 
-            # Create the agent with the checkpointer
-            self._agent = create_react_agent(
-                model=init_chat_model(
-                    model="gemini-2.5-flash",
-                    model_provider="google_genai",
-                ),
-                tools=[],
-                checkpointer=self._checkpointer,
-            )
+    ChatSession(session_id=str(session_id)).save_to_supabase()
 
-    def __del__(self):
-        """Clean up the database connection when the agent is destroyed."""
-        if self._checkpointer and hasattr(self._checkpointer, "conn"):
-            try:
-                self._checkpointer.conn.close()
-            except:
-                pass
+    initial_message = HumanMessage(
+        content=[
+            {"type": "text", "text": kickoff_message},
+            *video_media_parts,
+        ]
+    )
+    supabase.table("chat_messages").insert(
+        {
+            "role": "user",
+            "data": initial_message.__dict__,
+            "session_id": session_id,
+        }
+    ).execute()
 
-    async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
-        """Start the therapy session with therapist speaking first."""
-        system_prompt = _build_system_prompt()
+    # Use the persistent agent instead of creating a new one
+    async for part in parse_langgraph_stream(
+        graph.astream(
+            {
+                "messages": [
+                    SystemMessage(content=system_prompt),
+                    initial_message,
+                ],
+                "session_id": session_id,
+            },
+            stream_mode="messages",
+        )
+    ):
+        yield part
 
-        kickoff_message = "Finally, greet the patient warmly and ask ONE gentle, concrete recall question based on the prepared memories."
 
-        print("Extracting memories...")
-        video_media_parts = extract_memories()
+async def chat(
+    session_id: str, user_message: str
+) -> AsyncGenerator[StreamProtocolPart, None]:
+    """Continue the therapy conversation."""
+    message = HumanMessage(content=user_message)
 
-        # Use the persistent agent instead of creating a new one
-        async for part in parse_langgraph_stream(
-            self._agent.astream(
-                {
-                    "messages": [
-                        SystemMessage(content=system_prompt),
-                        HumanMessage(
-                            content=[
-                                {"type": "text", "text": kickoff_message},
-                                *video_media_parts,
-                            ]
-                        ),
-                    ],
-                },
-                config=self.config,
-                stream_mode="messages",
-            )
-        ):
-            yield part
+    # Use the persistent agent instead of creating a new one
+    graph_state = get_state_from_supabase(session_id)
+    graph_state["messages"] = graph_state["messages"] + [message]
+    print(graph_state)
+    supabase.table("chat_messages").insert(
+        {
+            "role": "user",
+            "data": message.__dict__,
+            "session_id": session_id,
+        }
+    ).execute()
 
-    async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
-        """Continue the therapy conversation."""
-        # Include video context if available
-        message = HumanMessage(content=user_message)
-
-        # Use the persistent agent instead of creating a new one
-        snapshot = self._agent.get_state(self.config)
-        graph_state = snapshot.values
-        graph_state["messages"] = graph_state["messages"] + [message]
-
-        async for part in parse_langgraph_stream(
-            self._agent.astream(graph_state, config=self.config, stream_mode="messages")
-        ):
-            yield part
+    async for part in parse_langgraph_stream(
+        graph.astream(graph_state, stream_mode="messages")
+    ):
+        yield part
 
 
 async def main():
@@ -340,31 +338,26 @@ async def main():
 
     args = parser.parse_args()
 
-    session_id = args.session_id or uuid.uuid4()
-    agent = ESIAgent(session_id=session_id)
+    session_id = args.session_id or str(uuid.uuid4())
     print(f"Session ID: {session_id}")
 
-    if args.chat:
-        async for part in agent.chat(args.chat):
+    print("Starting ESI therapy session...")
+    try:
+        # Therapist initiates
+        async for part in kickoff(session_id):
             print("Therapist:", part)
-    elif args.interactive:
-        print("Starting ESI therapy session...")
-        try:
-            # Therapist initiates
-            async for part in agent.kickoff():
+
+        # Interactive loop
+        while True:
+            user_input = input("You: ").strip()
+            if not user_input:
+                continue
+
+            async for part in chat(session_id, user_input):
                 print("Therapist:", part)
 
-            # Interactive loop
-            while True:
-                user_input = input("You: ").strip()
-                if not user_input:
-                    continue
-
-                async for part in agent.chat(user_input):
-                    print("Therapist:", part)
-
-        except KeyboardInterrupt:
-            print("\nSession ended. Your conversation is saved.")
+    except KeyboardInterrupt:
+        print("\nSession ended. Your conversation is saved.")
 
 
 if __name__ == "__main__":
