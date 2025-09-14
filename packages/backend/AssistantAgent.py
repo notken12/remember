@@ -166,6 +166,13 @@ class AssistantAgent:
         self.supabase = supabase
         self._graph = None
 
+        # Runtime provider selection
+        self._use_cerebras = str(os.getenv("USE_CEREBRAS", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+        self._cerebras_model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+        # Support both CEREBRAS_API_BASE and OPENAI_BASE_URL style envs (OpenAI-compatible)
+        self._cerebras_base_url = os.getenv("CEREBRAS_API_BASE", os.getenv("OPENAI_BASE_URL", "https://api.cerebras.ai/v1")).rstrip("/")
+        self._cerebras_api_key = os.getenv("CEREBRAS_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+
         # Compile a minimal graph mirroring esi_agent shape (agent <-> tools)
         self._build_graph()
 
@@ -336,7 +343,7 @@ Here are candidate clips (JSON):
 {dataset_json}
 """
 
-        llm = init_chat_model(model=self.model, model_provider="google_genai")
+        llm = self._get_chat_model()
         response = llm.invoke(prompt)
         text = getattr(response, "content", "")
 
@@ -392,7 +399,7 @@ Here are candidate clips (JSON):
             appends the AI message to the state, and writes the AI message to
             Supabase `chat_messages` with role "assistant".
             """
-            llm = init_chat_model(model=self.model, model_provider="google_genai")
+            llm = self._get_chat_model()
             llm = llm.bind_tools([select_video])
             message = llm.invoke(state["messages"])  # type: ignore[index]
             state["messages"].append(message)
@@ -462,6 +469,29 @@ Here are candidate clips (JSON):
         graph_builder.add_conditional_edges("agent", tools_condition)
         graph_builder.add_edge("tools", "agent")
         self._graph = graph_builder.compile()
+
+    def _get_chat_model(self):
+        """Return a chat model instance configured for Gemini or Cerebras.
+
+        - When USE_CEREBRAS is truthy, use the Cerebras OpenAI-compatible endpoint
+          with model `gpt-oss-120b` (overridable via CEREBRAS_MODEL).
+        - Otherwise, default to Google Gemini via `google_genai` provider using
+          the model configured in `self.model`.
+        """
+        if self._use_cerebras:
+            if not self._cerebras_api_key:
+                raise RuntimeError(
+                    "USE_CEREBRAS=True but no CEREBRAS_API_KEY/OPENAI_API_KEY provided"
+                )
+            # Use OpenAI-compatible provider pointed at Cerebras API
+            return init_chat_model(
+                model=self._cerebras_model,
+                model_provider="openai",
+                api_key=self._cerebras_api_key,
+                base_url=self._cerebras_base_url,
+            )
+        # Default: Google Gemini
+        return init_chat_model(model=self.model, model_provider="google_genai")
 
     async def query(
         self, user_query: str, session_id: Optional[str] = None
