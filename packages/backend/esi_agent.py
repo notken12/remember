@@ -226,11 +226,22 @@ Here are the candidate clips (JSON):
     return results[:max_items]
 
 
+@tool
+def end_esi_session() -> None:
+    """Call this tool to end the ESI session.
+    Only call this tool if the patient is ready to (finished all of their questions) or intends to end the session.
+    Do not end the session simply because the patient is having a hard time."""
+    return None
+
+
+tools = [end_esi_session]
+
+
 def agent(state: State) -> State:
     llm = init_chat_model(
         model="gemini-2.5-flash",
         model_provider="google_genai",
-    )
+    ).bind_tools(tools)
     # LLM expects a list of messages, not the entire state
     message = llm.invoke(state["messages"])
     state["messages"].append(message)
@@ -246,7 +257,7 @@ def agent(state: State) -> State:
 
 
 def tools(state: State) -> State:
-    node = ToolNode(tools=[])
+    node = ToolNode(tools=tools)
     tool_calls = node.invoke(state)
     state["messages"].extend(tool_calls)
     for tool_call in tool_calls:

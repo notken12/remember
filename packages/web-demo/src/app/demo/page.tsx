@@ -13,6 +13,7 @@ import { produce } from 'immer'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
 import { cn } from '@/lib/utils';
+import Image from 'next/image';
 
 export default function DemoPage() {
     const [messages, setMessages] = useState<UIMessage[]>([])
@@ -27,30 +28,76 @@ export default function DemoPage() {
         const sse = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
         sseRef.current = sse;
 
+        let controller: ReadableStreamDefaultController<UIMessageChunk> | null = null
+
+        const createAndProcessStream = async (): Promise<void> => {
+            console.log('Creating new ReadableStream...');
+            // Create the ReadableStream and store reference to prevent garbage collection
+            const stream = new ReadableStream<UIMessageChunk>({
+                start(c) {
+                    controller = c
+                },
+                cancel() {
+                    console.log('ReadableStream cancelled')
+                    // Only close SSE if we're actually cleaning up, not if stream is just being cancelled
+                    if (isCleaningUpRef.current && sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
+                        sseRef.current.close();
+                    }
+                },
+            });
+
+            streamRef.current = stream;
+
+            // Process the stream in a separate async function
+            await processUIMessageStream(stream);
+
+            console.log('Stream processing completed');
+        };
+
         sse.onopen = async () => {
             console.log('SSE connection opened');
-            let controller: ReadableStreamDefaultController<UIMessageChunk> | null = null
 
             sse.onmessage = (event) => {
                 console.log('SSE message received:', event)
-                if (!controller) return
                 try {
                     // Parse the event data and enqueue it
                     const data = JSON.parse(event.data);
                     if (data.type === 'data-transcription') {
                         setTranscription(data.data.text)
                         setTranscriptionIsFinal(data.data.is_final)
+                        console.log('transcription: ', data.data.text)
                         if (data.data.is_final) {
                             console.log('FINAL TRANSCRIPTION')
-                            setMessages(prev => [...prev, { id: crypto.randomUUID().toString(), "role": "user", "parts": [{ "type": "text", text: data.data.text }] }])
+                            // setMessages(prev => [...prev, { id: crypto.randomUUID().toString(), "role": "user", "parts": [{ "type": "text", text: data.data.text }] }])
+                            // // Close current controller if it exists
+                            // if (controller) {
+                            //     controller.close();
+                            //     controller = null;
+                            // }
+                            // // Create and process new stream
+                            // createAndProcessStream();
+                            return
                         }
-                        console.log('transcription: ', data.data.text)
+                        return
                     } else if (data.type === "finish") {
+                        console.log('FINISH message received, creating new stream...');
+                        // Close current controller if it exists
+                        if (controller) {
+                            controller.close();
+                            controller = null;
+                        }
+                        // Create and process new stream
+                        createAndProcessStream();
+                        return; // Don't enqueue finish message to the old controller
                     } else {
                         setTranscription("")
                         setTranscriptionIsFinal(false)
                     }
-                    controller.enqueue(data);
+
+                    // Only enqueue if we have an active controller
+                    if (controller) {
+                        controller.enqueue(data);
+                    }
                 } catch (error) {
                     console.error('Error parsing SSE data:', error);
                 }
@@ -60,47 +107,14 @@ export default function DemoPage() {
                 controller?.error(error);
             };
 
-            const createAndProcessStream = async (): Promise<void> => {
-                // Create the ReadableStream and store reference to prevent garbage collection
-                const stream = new ReadableStream<UIMessageChunk>({
-                    start(c) {
-                        controller = c
-                    },
-                    cancel() {
-                        console.log('ReadableStream cancelled')
-                        // Only close SSE if we're actually cleaning up, not if stream is just being cancelled
-                        if (isCleaningUpRef.current && sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
-                            sseRef.current.close();
-                        }
-                    },
-                });
-
-                streamRef.current = stream;
-
-                // Process the stream in a separate async function
-                await processUIMessageStream(stream);
-
-                console.log('Stream closed, creating new stream for continued processing...');
-                await createAndProcessStream(); // Subsequent streams are not the first
-            };
-
+            // Create initial stream
             await createAndProcessStream();
         };
 
         const processUIMessageStream = async (stream: ReadableStream<UIMessageChunk>) => {
             try {
                 for await (const uiMessage of readUIMessageStream({ stream })) {
-                    setMessages(produce(prev => {
-                        const matching = prev.findIndex(m => m.id === uiMessage.id)
-                        if (matching != -1) {
-                            prev[matching] = uiMessage
-                            console.log('matching', uiMessage)
-                        }
-                        else {
-                            prev.push(uiMessage)
-                            console.log('new', uiMessage)
-                        }
-                    }));
+                    setMessages([uiMessage])
                 }
             } catch (error) {
                 console.error('Error processing UI message stream:', error);
@@ -122,7 +136,7 @@ export default function DemoPage() {
         <div className="absolute inset-0">
             <WebcamBackground />
             <div className="absolute inset-0 p-4">
-                <ol className="max-h-full overflow-y-auto">
+                <ul className="max-h-full overflow-y-auto">
                     {messages.map((msg, msgIndex) => {
                         if (!msg.parts.some(p => !p.type.startsWith('data-'))) return null
                         return (
@@ -131,8 +145,8 @@ export default function DemoPage() {
                                 className={cn(
                                     "p-3 rounded-lg backdrop-blur-sm",
                                     {
-                                        "bg-blue-500/80 text-white ml-8": msg.role === "user",
-                                        "bg-white/80 text-black mr-8": msg.role === "assistant"
+                                        "bg-blue-500/40 text-white": msg.role === "user",
+                                        "bg-white/40 text-black": msg.role === "assistant"
                                     }
                                 )}
                             >
@@ -140,6 +154,23 @@ export default function DemoPage() {
                                     switch (part.type) {
                                         case "text":
                                             return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        case "tool-show_image":
+                                            return (
+                                                <video
+                                                    src={part.output?.url}
+                                                    className="max-w-96 max-h-96"
+                                                    muted
+                                                    preload="metadata"
+                                                />
+                                            )
+                                        case "tool-show_video_slice":
+                                            return (
+                                                <VideoSlice url={part.output?.url} start={part.input?.start} end={part.input?.end} />
+                                            )
+                                        case "tool-end_esi_session":
+                                            return <p>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
+                                        case "tool-end_sr_session":
+                                            return <p>SR session complete! You{"'"}re all done, congratulations!</p>
                                         default:
                                             if (part.type.startsWith('data-')) return null
                                             return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
@@ -151,10 +182,76 @@ export default function DemoPage() {
                     <li className={cn("text-foreground", { "opacity-70": !transcriptionIsFinal })}>
                         {transcription}
                     </li>
-                </ol>
+                </ul>
             </div>
         </div>
     )
+}
+
+function VideoSlice({ url, start, end }: { url: string, start: number, end: number }) {
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const [isLoaded, setIsLoaded] = useState(false);
+
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video) return;
+
+        const handleLoadedMetadata = () => {
+            // Set the video to start at the specified start time
+            video.currentTime = start;
+            setIsLoaded(true);
+        };
+
+        const handleLoadedData = () => {
+            // Auto-play once the video data is loaded
+            video.play().catch(error => {
+                console.error('Error playing video:', error);
+            });
+        };
+
+        const handleTimeUpdate = () => {
+            // Stop the video when it reaches the end time
+            if (video.currentTime >= end) {
+                video.pause();
+                video.currentTime = start; // Reset to start for potential replay
+            }
+        };
+
+        const handleSeeked = () => {
+            // Ensure we don't seek outside our allowed range
+            if (video.currentTime < start) {
+                video.currentTime = start;
+            } else if (video.currentTime > end) {
+                video.currentTime = end;
+                video.pause();
+            }
+        };
+
+        // Add event listeners
+        video.addEventListener('loadedmetadata', handleLoadedMetadata);
+        video.addEventListener('loadeddata', handleLoadedData);
+        video.addEventListener('timeupdate', handleTimeUpdate);
+        video.addEventListener('seeked', handleSeeked);
+
+        return () => {
+            // Cleanup event listeners
+            video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+            video.removeEventListener('loadeddata', handleLoadedData);
+            video.removeEventListener('timeupdate', handleTimeUpdate);
+            video.removeEventListener('seeked', handleSeeked);
+        };
+    }, [start, end]);
+
+    return (
+        <video
+            ref={videoRef}
+            src={url}
+            className="max-w-96 max-h-96"
+            controls
+            preload="metadata"
+            muted
+        />
+    );
 }
 
 export function WebcamBackground() {
