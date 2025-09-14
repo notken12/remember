@@ -2,7 +2,7 @@
 
 import os
 import uuid
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -17,7 +17,7 @@ class ChatMessage:
     providing Supabase integration for persistence.
     """
     
-    def __init__(self, content: str = "", session_id: Optional[str] = None, role: str = "user", message_id: Optional[str] = None):
+    def __init__(self, content: str = "", session_id: Optional[str] = None, role: str = "user", message_id: Optional[str] = None, data: Optional[Dict[str, Any]] = None):
         """
         Initialize a ChatMessage instance.
         
@@ -32,6 +32,7 @@ class ChatMessage:
         self.session_id = session_id
         self.role = role
         self.created_at = None  # Will be set by Supabase when inserted
+        self.data = data
         
         # Initialize Supabase client
         self.supabase_url = os.getenv("SUPABASE_URL")
@@ -70,12 +71,17 @@ class ChatMessage:
             print(f"   Content: {self.content[:50]}..." if len(self.content) > 50 else f"   Content: {self.content}")
             
             # Insert the message record into the database
-            response = self.supabase.table('chat_messages').insert({
+            payload = {
                 'id': self.id,
                 'content': self.content,
                 'session_id': self.session_id,
                 'role': self.role
-            }).execute()
+            }
+            # Include structured message data if provided (for LangGraph state reconstruction)
+            if self.data is not None:
+                payload['data'] = self.data
+
+            response = self.supabase.table('chat_messages').insert(payload).execute()
             
             if response.data:
                 self.created_at = response.data[0].get('created_at')

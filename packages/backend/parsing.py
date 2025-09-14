@@ -112,6 +112,11 @@ async def parse_langgraph_stream(
             )
             yield tool_output_part
 
+    if current_text_part_id:
+        yield TextEndPart(
+            id=current_text_part_id,
+        )
+
     if len(gathered_messages) > 0:
         message = gathered_messages[-1]
         # yield message

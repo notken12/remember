@@ -13,6 +13,8 @@ import { produce } from 'immer'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
 import { cn } from '@/lib/utils';
+import Image from 'next/image';
+import { createClient } from '@supabase/supabase-js';
 
 export default function DemoPage() {
     const [messages, setMessages] = useState<UIMessage[]>([])
@@ -27,32 +29,14 @@ export default function DemoPage() {
         const sse = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
         sseRef.current = sse;
 
-        sse.onopen = () => {
-            console.log('SSE connection opened');
+        let controller: ReadableStreamDefaultController<UIMessageChunk> | null = null
 
+        const createAndProcessStream = async (): Promise<void> => {
+            console.log('Creating new ReadableStream...');
             // Create the ReadableStream and store reference to prevent garbage collection
             const stream = new ReadableStream<UIMessageChunk>({
-                start(controller) {
-                    sse.onmessage = (event) => {
-                        console.log('SSE message received:', event)
-                        try {
-                            // Parse the event data and enqueue it
-                            const data = JSON.parse(event.data);
-                            if (data.type === 'data-transcription') {
-                                setTranscription(data.data.text)
-                                setTranscriptionIsFinal(data.data.isFinal)
-                                console.log('transcription: ', data.data.text)
-                            }
-                            controller.enqueue(data);
-                        } catch (error) {
-                            console.error('Error parsing SSE data:', error);
-                        }
-                    };
-
-                    sse.onerror = (error) => {
-                        console.error('SSE error:', error);
-                        controller.error(error);
-                    };
+                start(c) {
+                    controller = c
                 },
                 cancel() {
                     console.log('ReadableStream cancelled')
@@ -66,27 +50,72 @@ export default function DemoPage() {
             streamRef.current = stream;
 
             // Process the stream in a separate async function
-            processUIMessageStream(stream);
+            await processUIMessageStream(stream);
+
+            console.log('Stream processing completed');
         };
 
-        sse.onerror = (error) => {
-            console.error('SSE connection error:', error);
+        sse.onopen = async () => {
+            console.log('SSE connection opened');
+
+            sse.onmessage = (event) => {
+                console.log('SSE message received:', event)
+                try {
+                    // Parse the event data and enqueue it
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'data-transcription') {
+                        setTranscription(data.data.text)
+                        setTranscriptionIsFinal(data.data.is_final)
+                        console.log('transcription: ', data.data.text)
+                        if (data.data.is_final) {
+                            console.log('FINAL TRANSCRIPTION')
+                            // setMessages(prev => [...prev, { id: crypto.randomUUID().toString(), "role": "user", "parts": [{ "type": "text", text: data.data.text }] }])
+                            // // Close current controller if it exists
+                            // if (controller) {
+                            //     controller.close();
+                            //     controller = null;
+                            // }
+                            // // Create and process new stream
+                            // createAndProcessStream();
+                            return
+                        }
+                        return
+                    } else if (data.type === "finish") {
+                        console.log('FINISH message received, creating new stream...');
+                        // Close current controller if it exists
+                        if (controller) {
+                            controller.close();
+                            controller = null;
+                        }
+                        // Create and process new stream
+                        createAndProcessStream();
+                        return; // Don't enqueue finish message to the old controller
+                    } else {
+                        setTranscription("")
+                        setTranscriptionIsFinal(false)
+                    }
+
+                    // Only enqueue if we have an active controller
+                    if (controller) {
+                        controller.enqueue(data);
+                    }
+                } catch (error) {
+                    console.error('Error parsing SSE data:', error);
+                }
+            };
+            sse.onerror = (error) => {
+                console.error('SSE error:', error);
+                controller?.error(error);
+            };
+
+            // Create initial stream
+            await createAndProcessStream();
         };
 
         const processUIMessageStream = async (stream: ReadableStream<UIMessageChunk>) => {
             try {
                 for await (const uiMessage of readUIMessageStream({ stream })) {
-                    setMessages(produce(prev => {
-                        // Avoid duplicates by checking if message already exists
-                        const index = prev.findIndex(m => m.id === uiMessage.id);
-                        if (index == -1) {
-                            // @ts-expect-error deep
-                            prev.push(uiMessage)
-                        } else {
-                            prev[index] = uiMessage
-                        }
-                        return prev
-                    }));
+                    setMessages([uiMessage])
                 }
             } catch (error) {
                 console.error('Error processing UI message stream:', error);
@@ -108,7 +137,7 @@ export default function DemoPage() {
         <div className="absolute inset-0">
             <WebcamBackground />
             <div className="absolute inset-0 p-4">
-                <ol className="max-h-full overflow-y-auto">
+                <ul className="max-h-full overflow-y-auto">
                     {messages.map((msg, msgIndex) => {
                         if (!msg.parts.some(p => !p.type.startsWith('data-'))) return null
                         return (
@@ -117,8 +146,8 @@ export default function DemoPage() {
                                 className={cn(
                                     "p-3 rounded-lg backdrop-blur-sm",
                                     {
-                                        "bg-blue-500/80 text-white ml-8": msg.role === "user",
-                                        "bg-white/80 text-black mr-8": msg.role === "assistant"
+                                        "bg-blue-500/40 text-white": msg.role === "user",
+                                        "bg-white/40 text-black": msg.role === "assistant"
                                     }
                                 )}
                             >
@@ -126,6 +155,30 @@ export default function DemoPage() {
                                     switch (part.type) {
                                         case "text":
                                             return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        case "tool-select_video":
+                                            return (
+                                                <Video
+                                                    uuid={part.input?.video_uuid}
+                                                    controls
+                                                    autoPlay
+                                                />
+                                            )
+                                        case "tool-show_image":
+                                            return (
+                                                <Video
+                                                    uuid={part.input?.video_uuid}
+                                                    muted
+                                                    preload="metadata"
+                                                />
+                                            )
+                                        case "tool-show_video_slice":
+                                            return (
+                                                <VideoSlice uuid={part.input?.video_uuid} start={part.input?.start} end={part.input?.end} />
+                                            )
+                                        case "tool-end_esi_session":
+                                            return <p>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
+                                        case "tool-end_sr_session":
+                                            return <p>SR session complete! You{"'"}re all done, congratulations!</p>
                                         default:
                                             if (part.type.startsWith('data-')) return null
                                             return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
@@ -137,10 +190,98 @@ export default function DemoPage() {
                     <li className={cn("text-foreground", { "opacity-70": !transcriptionIsFinal })}>
                         {transcription}
                     </li>
-                </ol>
+                </ul>
             </div>
         </div>
     )
+}
+
+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_API_KEY!)
+
+function Video({ uuid, ...restProps }: { uuid: string } & React.ComponentProps<'video'>) {
+    const [url, setUrl] = useState('')
+    useEffect(() => {
+        (async () => {
+            const { data } = await supabase.from('videos').select('video_path').eq("id", uuid).single().throwOnError()
+            setUrl(supabase.storage.from('videos').getPublicUrl(data.video_path).data.publicUrl)
+        })()
+    }, [uuid])
+    return <video src={url}
+        className="max-w-96 max-h-96"
+        {...restProps}
+    />
+}
+
+function VideoSlice({ uuid, start, end }: { uuid: string, start: number, end: number }) {
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const [isLoaded, setIsLoaded] = useState(false);
+    const [url, setUrl] = useState('')
+
+    useEffect(() => {
+        (async () => {
+            const { data } = await supabase.from('videos').select('video_path').eq("id", uuid).single().throwOnError()
+            setUrl(supabase.storage.from('videos').getPublicUrl(data.video_path).data.publicUrl)
+        })()
+
+        const video = videoRef.current;
+        if (!video) return;
+
+        const handleLoadedMetadata = () => {
+            // Set the video to start at the specified start time
+            video.currentTime = start;
+            setIsLoaded(true);
+        };
+
+        const handleLoadedData = () => {
+            // Auto-play once the video data is loaded
+            video.play().catch(error => {
+                console.error('Error playing video:', error);
+            });
+        };
+
+        const handleTimeUpdate = () => {
+            // Stop the video when it reaches the end time
+            if (video.currentTime >= end) {
+                video.pause();
+                video.currentTime = start; // Reset to start for potential replay
+            }
+        };
+
+        const handleSeeked = () => {
+            // Ensure we don't seek outside our allowed range
+            if (video.currentTime < start) {
+                video.currentTime = start;
+            } else if (video.currentTime > end) {
+                video.currentTime = end;
+                video.pause();
+            }
+        };
+
+        // Add event listeners
+        video.addEventListener('loadedmetadata', handleLoadedMetadata);
+        video.addEventListener('loadeddata', handleLoadedData);
+        video.addEventListener('timeupdate', handleTimeUpdate);
+        video.addEventListener('seeked', handleSeeked);
+
+        return () => {
+            // Cleanup event listeners
+            video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+            video.removeEventListener('loadeddata', handleLoadedData);
+            video.removeEventListener('timeupdate', handleTimeUpdate);
+            video.removeEventListener('seeked', handleSeeked);
+        };
+    }, [start, end]);
+
+    return (
+        <video
+            ref={videoRef}
+            src={url}
+            className="max-w-96 max-h-96"
+            controls
+            preload="metadata"
+            muted
+        />
+    );
 }
 
 export function WebcamBackground() {
