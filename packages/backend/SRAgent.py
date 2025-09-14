@@ -8,9 +8,19 @@ Retrieval therapy agent that runs after an Episodic Specificity Induction (ESI)
 session has completed. Importantly, SR does not consume or depend on any ESI
 outputs. SR independently sources clips from Supabase (for now via a
 hardcoded/known table and columns; in the future, via dynamic discovery of
-recent/past clips). The SR agent schedules short, repeated recall sessions for
-those clips using increasing time intervals (e.g., 30s → 1m → 2m → 4m),
-adapting progression based on patient performance.
+recent/past clips).
+
+State and I/O model:
+    - This agent is intended to run under LangGraph with an AgentGraphState
+      (or equivalent) provided by the orchestrator.
+    - During a kickoff or chat call, the runtime will LOAD the graph state from
+      Supabase at the beginning and SAVE it back at the end. Within the turn,
+      SRAgent methods should only READ and UPDATE the in-memory graph state; do
+      not perform direct persistence.
+
+The SR agent schedules short, repeated recall sessions for selected clips using
+increasing time intervals (e.g., 30s → 1m → 2m → 4m), adapting progression
+based on patient performance.
 
 NOTE: This file intentionally provides method signatures and detailed
 docstrings only. No method contains business logic yet. A separate
@@ -98,11 +108,11 @@ class SRAgent:
     """Spaced Retrieval therapy agent interface and state container.
 
     Responsibilities:
-        - Initialize from Supabase after a prior ESI step has completed. The
-          SR agent does NOT receive data directly from the ESI agent and is
-          NOT called by the ESI agent. Instead, a client/user triggers SR
-          kickoff after ESI finishes, and SRAgent reads any needed inputs
-          (e.g., selected clip UUIDs and metadata) from Supabase.
+        - Initialize from repository data (Supabase) after a prior ESI step has
+          completed. The SR agent does NOT receive data directly from the ESI
+          agent and is NOT called by the ESI agent. Instead, a client/user
+          triggers SR kickoff after ESI finishes, and SRAgent loads any needed
+          inputs (e.g., selected clip UUIDs and metadata) from Supabase.
         - Prepare or fetch cue-based recall questions per clip via
           `SRQuestionGenerator.QuestionGenerator`.
         - Maintain a priority queue of recall tasks, scheduled per spaced
@@ -110,8 +120,9 @@ class SRAgent:
           Q&A mini-session for that clip.
         - After each mini-session, evaluate performance, advance/regress the
           interval, and reschedule the clip accordingly.
-        - Persist conversational turns and agent state to Supabase so that
-          sessions can be resumed seamlessly across devices.
+        - Integrate with LangGraph: read and write state via an AgentGraphState
+          structure during a single turn; rely on the LangGraph runtime to load
+          the state at the beginning of the call and persist it at the end.
 
     Important integration notes (non-goals of this file):
         - Streaming/tool-call mechanics (e.g., HUD display, LangChain events)
@@ -173,16 +184,18 @@ class SRAgent:
         string should not depend on model randomness.
 
         Behavior (to implement):
-            1) Ensure the chat session record exists in Supabase (idempotent).
-            2) Query Supabase to retrieve the authoritative inputs (e.g., list of selected clip UUIDs and any
-               clip metadata required for SR). If no such data is found, fall
-               back to a small, hardcoded subset for development/testing using
-               `hardcoded_subset_size`.
+            1) Ensure the chat session record exists (idempotent) if required by
+               the environment. Under LangGraph, session existence may be
+               guaranteed by the runtime.
+            2) Query Supabase to retrieve the authoritative inputs (e.g., list
+               of selected clip UUIDs and any clip metadata required for SR). If
+               no such data is found, fall back to a small, hardcoded subset for
+               development/testing using `hardcoded_subset_size`.
             3) For the chosen clips, pre-generate cue-based questions using
                `QuestionGenerator` (respecting `questions_per_clip`).
             4) Enqueue each clip for its first review at interval index 0.
-            5) Persist the SR scheduling state to Supabase BEFORE returning so
-               that subsequent chat turns can resume from the saved state.
+            5) Write all SR initialization data into the AgentGraphState so that
+               the LangGraph runtime can persist it at the end of the call.
 
         Args:
             hardcoded_subset_size: Fallback number of clips to select if the
@@ -194,8 +207,9 @@ class SRAgent:
 
         Notes:
             - Do not perform any model inference here, to preserve determinism.
-            - This method is responsible for loading inputs from Supabase and
-              saving the initial SR state back to Supabase before returning.
+            - This method should update only the in-memory AgentGraphState;
+              the LangGraph runtime will handle loading/saving to Supabase at
+              turn boundaries.
             - Streaming of this response, if needed, is the responsibility of
               higher layers. This method returns the full text.
         """
@@ -220,7 +234,9 @@ class SRAgent:
                 - If successful, advance to the next interval.
                 - Otherwise, step back to the previous interval (with floor at 0).
                 Enqueue the clip at the computed `next_at` time.
-            (e) Save all messages and updated SR state to Supabase.
+            (e) Update the AgentGraphState with any new messages and scheduling
+                changes. The LangGraph runtime will persist the updated state at
+                the end of the call.
 
         Args:
             user_text: The user's latest utterance.
@@ -465,47 +481,45 @@ class SRAgent:
     # ---------------------------------------------------------------------
 
     def ensure_session_saved(self) -> None:
-        """Idempotently upsert the underlying `ChatSession` in Supabase.
+        """Ensure session scaffolding exists (LangGraph environments may no-op).
 
-        Implementations should call the `ChatSession.save_to_supabase()` method
-        and tolerate the case where the session already exists. This method is
-        safe to call before any turn that needs persistence.
+        In a LangGraph + AgentGraphState setup, session creation/upsert and
+        persistence are typically managed by the runtime at the edges of the
+        call. Implementations may treat this as a no-op or as a lightweight
+        validation that the expected state keys are present in the graph state.
         """
         # No implementation yet
         pass
 
     def load_sr_state(self) -> None:
-        """Load any persisted SR scheduling state for this chat session.
+        """Hydrate in-memory fields from AgentGraphState (LangGraph-managed).
 
-        Implementations may choose one of several approaches:
-            - Use a dedicated Supabase table (e.g., `sr_states`) keyed by
-              `session_id`, storing a JSON blob of queue items.
-            - Store a special `ChatMessage` with role "system" that carries a
-              JSON payload; the latest one becomes authoritative.
-        Upon success, in-memory queue structures should reflect the persisted
-        state so that the agent can resume seamlessly.
+        Under LangGraph, the graph state will already be loaded at the start of
+        the call. This method should only read from that in-memory state and
+        populate local structures (e.g., priority queue) as needed. It should
+        not perform direct database I/O.
         """
         # No implementation yet
         pass
 
     def save_sr_state(self) -> None:
-        """Persist the current SR scheduling state to Supabase.
+        """Project in-memory changes back into AgentGraphState (no direct I/O).
 
-        Implementations should serialize the queue contents, interval policy,
-        and any clip/question caches into a JSON-friendly form and store it
-        under the current session. This allows the SR loop to resume across
-        process restarts and device boundaries.
+        In LangGraph, this method should only update the provided in-memory
+        AgentGraphState with the latest queue contents, interval indices, and
+        any clip/question caches. The orchestrator will persist state at the end
+        of the call.
         """
         # No implementation yet
         pass
 
     def save_turn_messages(self, user_text: str, assistant_text: str) -> None:
-        """Persist the user/assistant messages for this turn to Supabase.
+        """Record turn messages into AgentGraphState; runtime persists as needed.
 
-        Implementations should create `ChatMessage` rows associated with the
-        current `ChatSession`. This method allows higher-level streaming layers
-        to still persist a final, consolidated assistant message when the turn
-        completes.
+        In a LangGraph integration, higher layers may log message deltas and
+        streaming tokens. This helper can consolidate the final user/assistant
+        texts into the AgentGraphState so the runtime can persist them at the
+        end of the call. No direct database writes should occur here.
         """
         # No implementation yet
         pass
