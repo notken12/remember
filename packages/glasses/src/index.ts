@@ -28,24 +28,17 @@ class MyMentraOSApp extends AppServer {
       // } else {
       //   session.logger.info(`Photo uploaded: ${data.path}`)
       // }
-      //
-      //
 
-      const { hasActiveStream } = await session.camera.checkExistingStream()
-      if (hasActiveStream) {
-        await session.camera.stopManagedStream()
-        return
-      }
+    })
 
-      const urls = await session.camera.startManagedStream({ enableWebRTC: true, stream: { durationLimit: 1800 } })
-      const { previewUrl, dashUrl, hlsUrl, webrtcUrl, streamId, thumbnailUrl } = urls
-      session.logger.info(`Managed stream started: ${JSON.stringify(urls)}`)
-
-
-      // await session.camera.startStream({
-      //   rtmpUrl: "rtmp://localhost/live/livestream"
-      // })
-      // session.logger.info(`Stream started`)
+    session.events.onTranscription(async (data) => {
+      // session.logger.info(`Transcription: ${data.text}`)
+      const searchParams = new URLSearchParams({ text: data.text })
+      const url = process.env.BACKEND_URL + "/current_transcription?" + searchParams.toString()
+      await fetch(url, {
+        method: "POST",
+      })
+      session.logger.info(`Transcription sent to backend: ${data.text}`)
     })
 
     const statusUnsubscribe = session.camera.onManagedStreamStatus((data) => {
