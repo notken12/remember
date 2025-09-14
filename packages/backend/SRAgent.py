@@ -434,8 +434,78 @@ class SRAgent:
             - Streaming of this response, if needed, is the responsibility of
               higher layers. This method returns the full text.
         """
-        # No implementation yet
-        pass
+        # Ensure any required session scaffolding exists (may be a no-op)
+        try:
+            self.ensure_session_saved()
+        except Exception:
+            # Non-fatal; proceed with best-effort kickoff
+            pass
+
+        # Load existing SR state if present (LangGraph usually handles this)
+        try:
+            self.load_sr_state()
+        except Exception:
+            # Non-fatal; continue with fresh in-memory state
+            pass
+
+        # Discover candidate clips from Supabase
+        candidate_ids: List[str] = []
+        try:
+            candidate_ids = self._load_candidate_clips_from_supabase(limit=DEFAULT_CANDIDATE_LIMIT)
+        except Exception:
+            candidate_ids = []
+
+        # Fallback to env-provided list if Supabase returns none
+        if not candidate_ids:
+            fallback = os.getenv("SR_FALLBACK_CLIP_IDS", "")
+            if fallback:
+                # Comma-separated UUIDs
+                candidate_ids = [cid.strip() for cid in fallback.split(",") if cid.strip()]
+
+        # Deterministic selection of subset
+        try:
+            selected = self.select_clip_subset(candidate_ids, max_clips=int(hardcoded_subset_size))
+        except Exception:
+            selected = []
+
+        self._selected_clips = list(selected)
+
+        # Prepare questions per selected clip (cached when possible)
+        questions_map: Dict[str, List[Question]] = {}
+        if selected:
+            try:
+                questions_map = self.prepare_questions_for_clips(selected, questions_per_clip=self._questions_per_clip)
+            except Exception:
+                questions_map = {cid: [] for cid in selected}
+
+        # Enqueue each selected clip at interval index 0
+        now_ref = datetime.utcnow()
+        for cid in selected:
+            qlist = questions_map.get(cid, []) or []
+            try:
+                self.enqueue_clip_for_spaced_retrieval(
+                    cid,
+                    qlist,
+                    interval_index=0,
+                    base_time=now_ref,
+                    meta={},
+                )
+            except Exception:
+                # Skip enqueue failures to avoid blocking all clips
+                continue
+
+        # Update last activity timestamp and project into graph state
+        try:
+            self._last_activity_at = datetime.utcnow()
+            self.save_sr_state()
+        except Exception:
+            pass
+
+        n = len(selected)
+        return (
+            f"We will practice recall for {n} short clip{'s' if n != 1 else ''}. "
+            "When you're ready, say 'Begin'."
+        )
 
     def chat(self, user_text: str) -> str:
         """Handle one conversational turn of the SR loop and return assistant text.
