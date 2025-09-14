@@ -3,7 +3,7 @@
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12,11 +12,10 @@ if BACKEND_DIR not in sys.path:
     sys.path.append(BACKEND_DIR)
 
 from sr_agent import (
-    SRAgentRunner,
+    kickoff,
+    chat,
     ensure_sr_slice,
     configure_sr_from_env,
-    load_recent_video_ids,
-    select_first_n,
     enqueue,
     get_next_due,
     pop_next_due,
@@ -69,16 +68,16 @@ class TestSRRunnerStateHelpers(unittest.TestCase):
         self.assertIsNone(ensure_sr_slice(state).get("active_session"))
 
 
-class TestSRRunnerKickoffChat(unittest.IsolatedAsyncioTestCase):
+class TestSRKickoffChat(unittest.IsolatedAsyncioTestCase):
     async def test_kickoff_and_chat_smoke(self):
         # Use a unique session ID; rely on SR_FALLBACK_CLIP_IDS to avoid Supabase in test env
         os.environ["SR_FALLBACK_CLIP_IDS"] = "clipX,clipY"
         os.environ["SR_MAX_CLIPS"] = "1"
-        runner = SRAgentRunner(session_id="test_sr_session")
+        session_id = "test_sr_session_api"
 
         # Kickoff stream should yield at least one part
         received = []
-        async for part in runner.kickoff():
+        async for part in kickoff(session_id):
             received.append(part)
             if len(received) > 3:
                 break
@@ -86,7 +85,7 @@ class TestSRRunnerKickoffChat(unittest.IsolatedAsyncioTestCase):
 
         # Chat a single answer; ensure we get a streamed response
         received2 = []
-        async for part in runner.chat("My answer"):
+        async for part in chat(session_id, "My answer"):
             received2.append(part)
             if len(received2) > 3:
                 break

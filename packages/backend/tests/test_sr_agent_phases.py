@@ -12,7 +12,8 @@ if BACKEND_DIR not in sys.path:
     sys.path.append(BACKEND_DIR)
 
 from sr_agent import (
-    SRAgentRunner,
+    kickoff,
+    chat,
     ensure_sr_slice,
     set_stage,
     get_stage,
@@ -21,6 +22,7 @@ from sr_agent import (
     append_answer_and_advance,
     evaluate_session,
 )
+from agent_state import get_state_from_supabase
 
 
 class TestStageHelpers(unittest.TestCase):
@@ -79,17 +81,17 @@ class TestRunnerFlow(unittest.IsolatedAsyncioTestCase):
         os.environ["SR_FALLBACK_CLIP_IDS"] = "fake1,fake2"
         os.environ["SR_MAX_CLIPS"] = "1"
         os.environ["SR_FAST_START"] = "1"
-        self.runner = SRAgentRunner(session_id="test_sr_phase_flow")
+        self.session_id = "test_sr_phase_flow_api"
 
     async def test_fast_start_and_media_once(self):
         # Kickoff should attach media once and start first question (fast-start)
         parts = []
-        async for part in self.runner.kickoff():
+        async for part in kickoff(self.session_id):
             parts.append(part)
             if len(parts) > 2:
                 break
 
-        state = self.runner._get_state()
+        state = get_state_from_supabase(self.session_id)
         sr = ensure_sr_slice(state)
         # Fast-start implies session_active
         self.assertEqual(sr.get("stage"), "session_active")
@@ -112,12 +114,12 @@ class TestRunnerFlow(unittest.IsolatedAsyncioTestCase):
 
         # Now chat a wrong answer, ensure last control message does not reattach media
         parts2 = []
-        async for part in self.runner.chat("totally wrong"):
+        async for part in chat(self.session_id, "totally wrong"):
             parts2.append(part)
             if len(parts2) > 2:
                 break
 
-        state2 = self.runner._get_state()
+        state2 = get_state_from_supabase(self.session_id)
         msgs2 = state2.get("messages", [])
         self.assertGreaterEqual(len(msgs2), len(msgs))
         # Check the last HumanMessage added has only text blocks

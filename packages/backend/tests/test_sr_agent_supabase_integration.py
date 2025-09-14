@@ -11,7 +11,7 @@ BACKEND_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if BACKEND_DIR not in sys.path:
     sys.path.append(BACKEND_DIR)
 
-from sr_agent import SRAgentRunner
+from sr_agent import kickoff
 
 
 @unittest.skipUnless(
@@ -22,10 +22,10 @@ class TestSupabaseIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_kickoff_and_first_prompt_from_supabase(self):
         # Ensure we rely on Supabase discovery (clear fallback)
         os.environ.pop("SR_FALLBACK_CLIP_IDS", None)
-        runner = SRAgentRunner(session_id="sr_int_test")
+        session_id = "sr_int_test"
 
         received: List[str] = []
-        async for part in runner.kickoff():
+        async for part in kickoff(session_id):
             received.append(str(part))
             if len(received) > 5:
                 break
