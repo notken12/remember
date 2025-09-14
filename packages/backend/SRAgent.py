@@ -326,12 +326,60 @@ class SRAgent:
             "created_at",
             "inserted_at",
         ]
+        # Configurable candidate limit
+        self._candidate_limit: int = DEFAULT_CANDIDATE_LIMIT
+        # Apply environment overrides
+        self._configure_from_env()
         # LangGraph AgentGraphState reference (set by orchestrator per-turn)
         self.graph_state: Optional[AgentGraphState] = None
 
     # ---------------------------------------------------------------------
     # Clip discovery (Supabase) and deterministic selection
     # ---------------------------------------------------------------------
+
+    def _parse_int_list_env(self, var_name: str, fallback: List[int]) -> List[int]:
+        raw = os.getenv(var_name)
+        if not raw:
+            return list(fallback)
+        try:
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            vals = [int(p) for p in parts]
+            return vals or list(fallback)
+        except Exception:
+            return list(fallback)
+
+    def _parse_int_env(self, var_name: str, fallback: int) -> int:
+        raw = os.getenv(var_name)
+        if not raw:
+            return int(fallback)
+        try:
+            val = int(raw)
+            return val if val > 0 else int(fallback)
+        except Exception:
+            return int(fallback)
+
+    def _configure_from_env(self) -> None:
+        """Apply environment variable overrides to runtime configuration.
+
+        Recognized variables:
+            - SR_INTERVAL_SECONDS: comma-separated ints (e.g., "30,60,120,240")
+            - SR_QUESTIONS_PER_CLIP: integer > 0
+            - SR_CANDIDATE_LIMIT: integer > 0
+            - SR_VIDEO_TABLE: table name (already applied above)
+            - SR_VIDEO_TS_COLUMN: primary timestamp column (already applied)
+        """
+        # Intervals
+        intervals = self._parse_int_list_env("SR_INTERVAL_SECONDS", self._interval_seconds)
+        self._interval_seconds = [x for x in intervals if isinstance(x, int) and x > 0]
+        if not self._interval_seconds:
+            self._interval_seconds = list(DEFAULT_INTERVAL_SECONDS)
+
+        # Questions per clip
+        qpc = self._parse_int_env("SR_QUESTIONS_PER_CLIP", self._questions_per_clip)
+        self._questions_per_clip = qpc
+
+        # Candidate limit for discovery
+        self._candidate_limit = self._parse_int_env("SR_CANDIDATE_LIMIT", self._candidate_limit)
 
     def _load_candidate_clips_from_supabase(self, *, limit: int = DEFAULT_CANDIDATE_LIMIT) -> List[str]:
         """Load recent candidate clip IDs from Supabase for SR.
@@ -455,10 +503,13 @@ class SRAgent:
             # Non-fatal; continue with fresh in-memory state
             pass
 
+        # Validate environment and configuration
+        self._validate_environment(context="kickoff")
+
         # Discover candidate clips from Supabase
         candidate_ids: List[str] = []
         try:
-            candidate_ids = self._load_candidate_clips_from_supabase(limit=DEFAULT_CANDIDATE_LIMIT)
+            candidate_ids = self._load_candidate_clips_from_supabase(limit=self._candidate_limit)
         except Exception:
             candidate_ids = []
 
@@ -534,6 +585,35 @@ class SRAgent:
             f"We will practice recall for {n} short clip{'s' if n != 1 else ''}. "
             "When you're ready, say 'Begin'."
         )
+
+    def _validate_environment(self, *, context: str = "") -> None:
+        """Emit helpful warnings if configuration is likely to fail.
+
+        This method only prints guidance; it never raises.
+        """
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        fallback_ids = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
+
+        if not url or not key:
+            if not fallback_ids:
+                try:
+                    print(
+                        f"[SR:{context}] Warning: SUPABASE_URL/KEY not set and no SR_FALLBACK_CLIP_IDS provided. "
+                        "Kickoff may find 0 clips."
+                    )
+                except Exception:
+                    pass
+        if self._questions_per_clip <= 0:
+            try:
+                print(f"[SR:{context}] Warning: SR_QUESTIONS_PER_CLIP <= 0; using default {DEFAULT_QUESTIONS_PER_CLIP}.")
+            except Exception:
+                pass
+        if not self._interval_seconds:
+            try:
+                print(f"[SR:{context}] Warning: SR_INTERVAL_SECONDS produced empty list; using default schedule {DEFAULT_INTERVAL_SECONDS}.")
+            except Exception:
+                pass
 
     def chat(self, user_text: str) -> str:
         """Handle one conversational turn of the SR loop and return assistant text.
