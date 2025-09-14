@@ -912,7 +912,7 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
         # Media context as a HumanMessage; Gemini system instructions must be text-only
         HumanMessage(
             content=[
-                {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
+                {"type": "text", "text": "Non-conversational context for internal reference only. Do NOT mention or describe this media to the user. Use it only to craft questions. No links."},
                 *media_parts_all,
             ]
         ),
@@ -921,8 +921,6 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
         messages.append(SystemMessage(content=f"Say only this question exactly: {first_prompt}", name="next_question"))
     else:
         messages.append(SystemMessage(content="Your very next response must be exactly: Are you ready to begin?", name="kickoff_directive"))
-    # Seed a minimal human turn so the chat model has user content to respond to
-    messages.append(HumanMessage(content="hi"))
     state["messages"] = messages
     # Persist kickoff messages to Supabase
     for m in state["messages"]:
