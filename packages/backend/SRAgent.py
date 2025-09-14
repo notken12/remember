@@ -748,8 +748,37 @@ class SRAgent:
             A concise assistant message summarizing the interaction for this
             turn. Streaming layers may yield intermediate tokens separately.
         """
-        # No implementation yet
-        pass
+        # Initialize or continue an active session for this clip
+        if not self._active_session or self._active_session.get("clip_id") != item.clip_id:
+            self._active_session = {
+                "clip_id": item.clip_id,
+                "q_index": 0,
+                "exchanges": [],
+            }
+
+        # Best-effort HUD display hook (upper layers may intercept)
+        try:
+            self.display_clip_to_hud(item.clip_id)
+        except Exception:
+            pass
+
+        # If there are no prepared questions, provide a graceful message
+        if not item.questions:
+            return (
+                "I don't have prepared questions for this clip yet. "
+                "Let's move on for now; we can return when questions are ready."
+            )
+
+        q_index = int(self._active_session.get("q_index", 0))
+        if q_index < 0:
+            q_index = 0
+        if q_index >= len(item.questions):
+            # All questions asked; provide a brief wrap
+            return "We've covered the questions for this clip. Nice work."
+
+        current_question = item.questions[q_index]
+        prompt = current_question.text_cue.strip() or "Take a moment to recall one concrete detail from this clip."
+        return f"Let's focus on this moment. {prompt}"
 
     def display_clip_to_hud(
         self,
@@ -791,8 +820,25 @@ class SRAgent:
                 "success": bool, # Whether to advance the interval
             }
         """
-        # No implementation yet
-        pass
+        # If no active session, nothing to do
+        if not self._active_session:
+            return {"exchanges": [], "score": 0.0, "success": False}
+
+        q_index = int(self._active_session.get("q_index", 0))
+        exchanges = list(self._active_session.get("exchanges", []))
+
+        total_questions = max(1, len(questions))
+
+        # Compute a naive score based on presence of user responses so far
+        answered = len([ex for ex in exchanges if str(ex.get("user", "")).strip()])
+        score = min(1.0, answered / float(total_questions))
+        success = score >= 0.7
+
+        return {
+            "exchanges": exchanges,
+            "score": score,
+            "success": success,
+        }
 
     def evaluate_performance(self, session_result: Dict[str, Any]) -> bool:
         """Determine whether the patient performed well enough to advance.
@@ -809,8 +855,24 @@ class SRAgent:
               strong engagement). Later versions may perform semantic
               comparison or rubric-based scoring.
         """
-        # No implementation yet
-        pass
+        # Prefer explicit score if provided
+        try:
+            score = float(session_result.get("score", 0.0))
+            return score >= 0.7
+        except Exception:
+            pass
+
+        # Fallback: proportion of non-empty user responses
+        exchanges = session_result.get("exchanges", []) or []
+        total = max(1, len(exchanges))
+        answered = 0
+        for ex in exchanges:
+            try:
+                if str(ex.get("user", "")).strip():
+                    answered += 1
+            except Exception:
+                continue
+        return (answered / float(total)) >= 0.7
 
     def schedule_next_review(
         self,
@@ -829,8 +891,25 @@ class SRAgent:
             - Compute new `next_at` using `interval_seconds[next_index]`.
             - Enqueue with updated `interval_index` and incremented `attempt_count`.
         """
-        # No implementation yet
-        pass
+        if not self._interval_seconds:
+            return
+        last_index = len(self._interval_seconds) - 1
+        if success:
+            next_index = min(current_interval_index + 1, last_index)
+        else:
+            next_index = max(current_interval_index - 1, 0)
+
+        reference_time = now or datetime.utcnow()
+        try:
+            self.enqueue_clip_for_spaced_retrieval(
+                clip_id,
+                questions,
+                interval_index=next_index,
+                base_time=reference_time,
+            )
+        except Exception:
+            # Best-effort: if re-enqueue fails, skip silently to avoid breaking the loop
+            return
 
     # ---------------------------------------------------------------------
     # Waiting/small-talk behavior
