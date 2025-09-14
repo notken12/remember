@@ -513,6 +513,10 @@ def _soft_match_correct(user_answer: str, expected_answer: str) -> bool:
     # simple synonyms/variants
     synonyms = {
         "splash": {"splash", "splashing", "splashing around", "splash around", "playing in water"},
+        "black": {"black", "dark", "dark-colored", "dark coloured"},
+        "canyon": {"canyon", "canyons", "rocky canyon", "rocky canyons", "river canyon", "rocky valley"},
+        "valley": {"valley", "river valley", "rocky valley"},
+        "two": {"two", "2", "a couple", "couple"},
     }
     for key, variants in synonyms.items():
         if key in ea:
@@ -521,7 +525,7 @@ def _soft_match_correct(user_answer: str, expected_answer: str) -> bool:
     # token overlap heuristic
     ua_tokens = set(ua.replace("\n", " ").split())
     ea_tokens = set(ea.replace("\n", " ").split())
-    if len(ea_tokens) > 0 and len(ua_tokens & ea_tokens) / len(ea_tokens) >= 0.6:
+    if len(ea_tokens) > 0 and len(ua_tokens & ea_tokens) / len(ea_tokens) >= 0.45:
         return True
     # substring
     if ua in ea or ea in ua:
@@ -537,12 +541,14 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
     model = init_chat_model(model="gemini-2.5-flash", model_provider="google_genai")
     instruction = (
         "You are grading a short recall answer for spaced retrieval. Decide if the user's answer matches the expected answer. "
-        "Allow paraphrases, synonyms, and somewhat-close natural variants (e.g., 'splashing' ≈ 'splashing around'). Consider semantic equivalence over exact wording. They don't have to get it exactly correct. "
+        "Be lenient: accept paraphrases, synonyms, plural/singular variants, close color/number descriptors, and everyday phrasing. "
+        "Favor semantic equivalence over exact wording; only mark incorrect if clearly incompatible. If in doubt, mark correct. "
         "Return ONLY JSON: {\"correct\": true|false, \"feedback\": string, \"correct_answer\": string}. Keep feedback one short sentence.\n\n"
         "Examples (grade as correct):\n"
         "- expected: 'splashing in the river'; user: 'they were splashing around'\n"
         "- expected: 'rocky canyons'; user: 'rocky canyon'\n"
         "- expected: 'black shorts'; user: 'dark shorts'\n"
+        "- expected: 'two people'; user: 'a couple'\n"
     )
     payload = {
         "question": question_text,
@@ -560,8 +566,13 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            result["correct"] = bool(parsed.get("correct", False))
-            result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if result["correct"] else "That's not quite right.")
+            parsed_correct = bool(parsed.get("correct", False))
+            # If model says incorrect but soft match thinks it's correct, flip to correct
+            if not parsed_correct and _soft_match_correct(user_answer, expected_answer):
+                parsed_correct = True
+                parsed["feedback"] = parsed.get("feedback") or "Correct."
+            result["correct"] = parsed_correct
+            result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if parsed_correct else "That's not quite right.")
             result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
             return result
     except Exception:
@@ -572,8 +583,12 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
             if start != -1 and end != -1 and end > start:
                 parsed = json.loads(text[start : end + 1])
                 if isinstance(parsed, dict):
-                    result["correct"] = bool(parsed.get("correct", False))
-                    result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if result["correct"] else "That's not quite right.")
+                    parsed_correct = bool(parsed.get("correct", False))
+                    if not parsed_correct and _soft_match_correct(user_answer, expected_answer):
+                        parsed_correct = True
+                        parsed["feedback"] = parsed.get("feedback") or "Correct."
+                    result["correct"] = parsed_correct
+                    result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if parsed_correct else "That's not quite right.")
                     result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
                     return result
         except Exception:
