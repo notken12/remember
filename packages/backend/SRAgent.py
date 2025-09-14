@@ -35,6 +35,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union, TYPE_CHECKING
 import heapq
+from supabase import create_client, Client
 
 # External dependencies used elsewhere in the codebase
 from dotenv import load_dotenv
@@ -318,6 +319,68 @@ class SRAgent:
         # Chat session placeholder (LangGraph may manage persistence separately)
         self.session = session  # type: ignore[assignment]
         self.session_id = session_id
+        # Clip source configuration (can be overridden by environment)
+        self._video_table: str = os.getenv("SR_VIDEO_TABLE", "test_videos")
+        self._video_ts_columns: List[str] = [
+            os.getenv("SR_VIDEO_TS_COLUMN", "time_created"),
+            "created_at",
+            "inserted_at",
+        ]
+
+    # ---------------------------------------------------------------------
+    # Clip discovery (Supabase) and deterministic selection
+    # ---------------------------------------------------------------------
+
+    def _load_candidate_clips_from_supabase(self, *, limit: int = DEFAULT_CANDIDATE_LIMIT) -> List[str]:
+        """Load recent candidate clip IDs from Supabase for SR.
+
+        The method attempts to order by a preferred timestamp column. If that
+        fails, it falls back to a simple `select('id')` without ordering. Any
+        errors or missing configuration result in an empty list (callers should
+        handle fallback behavior).
+
+        Args:
+            limit: Maximum number of candidate IDs to fetch.
+
+        Returns:
+            List of clip UUID strings, most-recent-first when possible.
+        """
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            return []
+
+        try:
+            client: Client = create_client(url, key)
+        except Exception:
+            return []
+
+        # Try ordering by preferred timestamp columns first
+        for ts_col in self._video_ts_columns:
+            try:
+                query = client.table(self._video_table).select("id, {}".format(ts_col))
+                query = query.order(ts_col, desc=True)
+                if limit:
+                    query = query.limit(limit)
+                resp = query.execute()
+                data = resp.data or []
+                ids = [str(row["id"]) for row in data if row.get("id")]
+                if ids:
+                    return ids
+            except Exception:
+                continue
+
+        # Final fallback: no ordering, only IDs
+        try:
+            query = client.table(self._video_table).select("id")
+            if limit:
+                query = query.limit(limit)
+            resp = query.execute()
+            data = resp.data or []
+            ids = [str(row.get("id")) for row in data if row.get("id")]
+            return ids
+        except Exception:
+            return []
 
     # ---------------------------------------------------------------------
     # Public API
@@ -426,8 +489,12 @@ class SRAgent:
         Returns:
             Ordered list of chosen clip UUIDs, length in [0, max_clips].
         """
-        # No implementation yet
-        pass
+        if max_clips <= 0:
+            return []
+        if not all_clip_ids:
+            return []
+        # Deterministic: take the first N in given order
+        return list(all_clip_ids[:max_clips])
 
     def prepare_questions_for_clips(
         self,
