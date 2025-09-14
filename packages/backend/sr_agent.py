@@ -10,10 +10,13 @@ from dotenv import load_dotenv
 from SRQuestionGenerator import QuestionGenerator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode, create_react_agent, tools_condition
 # from postgres import AsyncPostgresSaver  # Lazily imported in _initialize_agent to avoid libpq issues in tests
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
+from agent_state import State, get_state_from_supabase
+from chat.ChatSession import ChatSession
 import uuid
 from supabase import Client, create_client
 
@@ -701,90 +704,35 @@ def _build_system_prompt_waiting() -> str:
     )
 
 
-class SRAgentRunner:
-    def __init__(self, session_id: Optional[str] = None):
-        self.database_url = os.getenv("DATABASE_URL", "")
-        if not self.database_url:
-            raise ValueError("DATABASE_URL is required")
+def _build_graph() -> StateGraph:
+    graph_builder = StateGraph(State)
 
-        self.session_id = session_id or f"sr_session_{datetime.now().isoformat()}"
-        self.config = {"configurable": {"thread_id": self.session_id}}
-
-        # Initialize single checkpointer and agent (like esi_agent.py)
-        self._checkpointer = None
-        self._agent = None
-        self._initialize_agent()
-
-    def _initialize_agent(self):
-        if self._checkpointer is None:
-            try:
-                from psycopg import Connection
-                from psycopg.rows import dict_row
-                from postgres import AsyncPostgresSaver  # lazy import here
-
-                conn = Connection.connect(
-                    self.database_url,
-                    autocommit=True,
-                    prepare_threshold=0,
-                    row_factory=dict_row,
-                    connect_timeout=30,
-                    options="-c statement_timeout=300000",
-                )
-                self._checkpointer = AsyncPostgresSaver(conn, None)
-                self._checkpointer._conn_string = self.database_url
-                self._agent = create_react_agent(
-                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
-                    tools=[],
-                    checkpointer=self._checkpointer,
-                )
-            except Exception as e:
-                # Log fallback so it's visible during tests/dev
-                try:
-                    print(f"[SR] Falling back to in-memory state (no Postgres checkpointer): {type(e).__name__}: {e}")
-                except Exception:
-                    pass
-                # Fallback to agent without external checkpointer; keep an in-memory state copy
-                self._memory_state: Dict[str, Any] = {}
-                self._checkpointer = None
-                self._agent = create_react_agent(
-                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
-                    tools=[],
-                    checkpointer=None,
-                )
-
-    def __del__(self):
-        if self._checkpointer and hasattr(self._checkpointer, "conn"):
-            try:
-                self._checkpointer.conn.close()
-            except Exception:
-                pass
-
-    def _get_state(self) -> Dict[str, Any]:
-        try:
-            snapshot = self._agent.get_state(self.config)
-            state = snapshot.values
-        except Exception:
-            state = {}
-        # Merge in-memory SR slice for continuity when no checkpointer is available
-        mem_sr: Optional[Dict[str, Any]] = None
-        if hasattr(self, "_memory_state") and isinstance(getattr(self, "_memory_state", {}).get("sr"), dict):
-            mem_sr = getattr(self, "_memory_state")["sr"]  # type: ignore[index]
-        if not state and hasattr(self, "_memory_state"):
-            state = self._memory_state
-        # Prefer memory SR if available to avoid losing stage/active_session between turns
-        if isinstance(mem_sr, dict):
-            state["sr"] = mem_sr
-        elif "sr" not in state or not isinstance(state.get("sr"), dict):
-            state["sr"] = {}
-            # Seed memory with a fresh sr slice so subsequent turns persist
-            if hasattr(self, "_memory_state"):
-                self._memory_state["sr"] = state["sr"]
+    def agent_node(state: State) -> State:
+        llm = init_chat_model(
+            model="gemini-2.5-flash",
+            model_provider="google_genai",
+        )
+        message = llm.invoke(state["messages"])  # type: ignore[index]
+        state["messages"].append(message)
         return state
 
-    async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
-        state = self._get_state()
+    graph_builder.add_node("agent", agent_node)
+    # Tools placeholder for future HUD/tool calls
+    tools_node = ToolNode(tools=[])
+    graph_builder.add_node("tools", tools_node)
+    graph_builder.add_edge(START, "agent")
+    graph_builder.add_conditional_edges("agent", tools_condition)
+    graph_builder.add_edge("tools", "agent")
+    return graph_builder.compile()
+
+async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
+    graph = _build_graph()
+    # Create ChatSession row (mirror ESI)
+    ChatSession(session_id=str(session_id)).save_to_supabase()
+    # Build initial state container
+    state: Dict[str, Any] = {"messages": [], "session_id": str(session_id)}
         # Initialize config/defaults on sr slice
-        configure_sr_from_env(state)
+    configure_sr_from_env(state)
 
         # Discover and select
         candidates = load_recent_video_ids(state)
@@ -898,21 +846,25 @@ class SRAgentRunner:
             except Exception:
                 pass
 
-        async for part in parse_langgraph_stream(
-            self._agent.astream(state, config=self.config, stream_mode="messages")
-        ):
-            yield part
+    # Stream with graph
+    async for part in parse_langgraph_stream(
+        graph.astream(state, stream_mode="messages")
+    ):
+        yield part
 
-    async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
-        state = self._get_state()
-        sr = ensure_sr_slice(state)
+async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
+    graph = _build_graph()
+    # Load existing message history from Supabase
+    state: State = get_state_from_supabase(session_id)
+    # State is a dict-like with messages; we will mutate and stream
+    sr = ensure_sr_slice(state)  # type: ignore[arg-type]
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
         # If session active: record answer and determine next step
         sess = sr.get("active_session")
         human_content: List[Any]
         # Always append the user's utterance to history first to preserve continuity
-        prior_messages = state.get("messages", []) or []
+        prior_messages = state.get("messages", []) or []  # type: ignore[index]
         user_text = (user_message or "")
         if user_text:
             prior_messages = prior_messages + [HumanMessage(content=user_text)]
@@ -1013,7 +965,7 @@ class SRAgentRunner:
                     human_content = [{"type": "text", "text": msg}]
 
         # Append control instruction only; do not re-add system prompts on chat turns
-        state["messages"] = prior_messages + [
+        state["messages"] = prior_messages + [  # type: ignore[index]
             HumanMessage(content=human_content),
         ]
 
@@ -1024,10 +976,10 @@ class SRAgentRunner:
             except Exception:
                 pass
 
-        async for part in parse_langgraph_stream(
-            self._agent.astream(state, config=self.config, stream_mode="messages")
-        ):
-            yield part
+    async for part in parse_langgraph_stream(
+        graph.astream(state, stream_mode="messages")
+    ):
+        yield part
 
 
 async def main():
@@ -1052,27 +1004,26 @@ async def main():
     args = parser.parse_args()
 
     session_id = args.session_id or str(uuid.uuid4())
-    runner = SRAgentRunner(session_id=session_id)
     print(f"Session ID: {session_id}")
     fast = os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"}
     mode = "FAST-START" if fast else "READINESS-GATED"
     print(f"Kickoff mode: {mode}")
 
     if args.chat:
-        async for part in runner.chat(args.chat):
+        async for part in chat(session_id, args.chat):
             print("Coach:", part)
     elif args.interactive:
         print("Starting SR session...")
         print("- Kickoff will "+("start immediately with the first question." if fast else "ask if you're ready first."))
         print("- Type your responses. To start after readiness prompt, type 'ready'. Ctrl+C to quit.")
         try:
-            async for part in runner.kickoff():
+            async for part in kickoff(session_id):
                 print("Coach:", part)
             while True:
                 user_input = input("You: ").strip()
                 if not user_input:
                     continue
-                async for part in runner.chat(user_input):
+                async for part in chat(session_id, user_input):
                     print("Coach:", part)
         except KeyboardInterrupt:
             print("\nSession ended. Your conversation is saved.")
