@@ -445,8 +445,15 @@ def append_answer_and_advance(state: Dict[str, Any], answer: str) -> None:
     if q_index < 0 or q_index >= len(qs):
         return
     question_text = str(qs[q_index].get("text_cue", ""))
+    expected_answer = str(qs[q_index].get("answer", ""))
     exchanges = list(sess.get("exchanges", []))
-    exchanges.append({"question": question_text, "user": str(answer or "").strip(), "assessment": ""})
+    exchanges.append({
+        "question": question_text,
+        "user": str(answer or "").strip(),
+        "assessment": "",
+        "q_index": int(q_index),
+        "expected_answer": expected_answer,
+    })
     sess["exchanges"] = exchanges
     sess["q_index"] = q_index + 1
     sr["active_session"] = sess
@@ -463,7 +470,12 @@ def session_finished(state: Dict[str, Any]) -> bool:
 
 
 def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Return {score: float, success: bool} using 0.7 threshold on non-empty answers."""
+    """Return {score: float, success: bool} prioritizing assessment-based correctness.
+
+    If per-exchange "assessment" exists (correct/incorrect), use it.
+    Otherwise, fallback to counting non-empty answers as correct.
+    Success threshold: 0.7.
+    """
     sr = ensure_sr_slice(state)
     sess = sr.get("active_session")
     if not isinstance(sess, dict):
@@ -471,14 +483,25 @@ def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
     qs = sess.get("questions", []) or []
     exchanges = list(sess.get("exchanges", []))
     total = max(1, len(qs))
-    answered = 0
-    for ex in exchanges:
-        try:
-            if str(ex.get("user", "")).strip():
-                answered += 1
-        except Exception:
-            continue
-    score = min(1.0, answered / float(total))
+    have_assessment = any(
+        isinstance(ex, dict) and ex.get("assessment") in {"correct", "incorrect"} for ex in exchanges
+    )
+    correct_count = 0
+    if have_assessment:
+        for ex in exchanges:
+            try:
+                if ex.get("assessment") == "correct":
+                    correct_count += 1
+            except Exception:
+                continue
+    else:
+        for ex in exchanges:
+            try:
+                if str(ex.get("user", "")).strip():
+                    correct_count += 1
+            except Exception:
+                continue
+    score = min(1.0, correct_count / float(total))
     return {"score": score, "success": score >= 0.7}
 
 
@@ -766,6 +789,8 @@ class SRAgentRunner:
             # Evaluate user's answer with LLM against expected answer for the current question
             qs = sess.get("questions", []) or []
             q_index = int(sess.get("q_index", 0))
+            # Snapshot pending eval index so we grade against the intended question
+            sr["pending_eval_q_index"] = q_index
             expected_answer = ""
             question_text = ""
             if 0 <= q_index < len(qs):
@@ -773,16 +798,20 @@ class SRAgentRunner:
                 question_text = str(qs[q_index].get("text_cue", ""))
             eval_res = _evaluate_answer_with_llm(question_text, expected_answer, user_message)
 
-            # Record assessment on the exchange and advance
+            # Record exchange with index/expected answer and advance
             append_answer_and_advance(state, user_message)
-            # Patch the last exchange with assessment so evaluate_session can compute score
+            # Patch the exchange that matches the pending index with assessment
             sess2 = ensure_sr_slice(state).get("active_session")
             if isinstance(sess2, dict):
                 exchanges = list(sess2.get("exchanges", []))
-                if exchanges:
-                    exchanges[-1]["assessment"] = "correct" if eval_res.get("correct") else "incorrect"
-                    sess2["exchanges"] = exchanges
-                    ensure_sr_slice(state)["active_session"] = sess2
+                target_idx = sr.get("pending_eval_q_index")
+                for ex in reversed(exchanges):
+                    if isinstance(ex, dict) and ex.get("q_index") == target_idx:
+                        ex["assessment"] = "correct" if eval_res.get("correct") else "incorrect"
+                        break
+                sess2["exchanges"] = exchanges
+                ensure_sr_slice(state)["active_session"] = sess2
+            sr["pending_eval_q_index"] = None
 
             feedback_lines = []
             if eval_res.get("correct"):
