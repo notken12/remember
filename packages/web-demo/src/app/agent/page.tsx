@@ -1,17 +1,29 @@
-import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
+import { createClient } from "@supabase/supabase-js";
+import VideoGrid from "@/components/VideoGrid";
 
-export default function AgentPage() {
+interface Video {
+    id: string;
+    video_path: string;
+    videoURL: string;
+    time_created: string;
+    title?: string;
+    description?: string;
+}
+
+export default async function AgentPage() {
+    const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_API_KEY!)
+    const { data } = await supabase.from('videos').select('*').throwOnError();
+    const videos: Video[] = data.map(v => {
+        return {
+            ...v,
+            videoURL: supabase.storage.from('videos').getPublicUrl(v.video_path).data.publicUrl
+        }
+    })
+
     return (
-        <div className="h-full">
-            <ResizablePanelGroup direction="horizontal">
-                <ResizablePanel defaultSize={75} className="py-6 px-4">
-                    <h1 className="scroll-m-20 text-3xl font-semibold tracking-tight">Memories</h1>
-                </ResizablePanel>
-                <ResizableHandle />
-                <ResizablePanel defaultSize={25} className="py-6 px-4">
-                    <h1 className="scroll-m-20 text-3xl font-semibold tracking-tight">Agent</h1>
-                </ResizablePanel>
-            </ResizablePanelGroup>
+        <div className="h-full container mx-auto p-6">
+            <h1 className="scroll-m-20 text-3xl font-semibold tracking-tight mb-8">Memories</h1>
+            <VideoGrid videos={videos} />
         </div>
     )
 }

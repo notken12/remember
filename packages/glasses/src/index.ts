@@ -20,13 +20,34 @@ class MyMentraOSApp extends AppServer {
 
     let currentEsiSessionId: string | null = null
     let aiTalking = false
+    let accumulatedTranscription = ""
 
     session.events.onButtonPress(async (e) => {
       session.logger.info(`Button pressed: ${e.buttonId}`)
+
+      // If we have accumulated transcription and an active ESI session, submit it via button
+      if (accumulatedTranscription && currentEsiSessionId) {
+        session.logger.info(`Button-submitting accumulated transcription to ESI session: ${accumulatedTranscription}`)
+        const chatParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: accumulatedTranscription })
+        const chatUrl = process.env.BACKEND_URL + "/esi_chat?" + chatParams.toString()
+        aiTalking = true
+        await fetch(chatUrl, {
+          method: "POST",
+        })
+        aiTalking = false
+        session.logger.info(`Accumulated transcription button-submitted to ESI session`)
+
+        // Clear the accumulated transcription after successful submission
+        accumulatedTranscription = ""
+        session.logger.info(`Accumulated transcription cleared after button submission`)
+        return
+      }
+
+      // If no accumulated transcription or no active session, start a new ESI session
       currentEsiSessionId = randomUUID().toString()
       const searchParams = new URLSearchParams({ session_id: currentEsiSessionId })
       const url = process.env.BACKEND_URL + "/esi_session?" + searchParams.toString()
-      session.logger.info(`Starting ESI session`)
+      session.logger.info(`Starting new ESI session`)
       aiTalking = true
       await fetch(url, {
         method: "POST",
@@ -37,21 +58,36 @@ class MyMentraOSApp extends AppServer {
 
     session.events.onTranscription(async (data) => {
       // session.logger.info(`Transcription: ${data.text}`)
+
+      // Accumulate transcription text for button submission
+      if (data.isFinal) {
+        accumulatedTranscription += (accumulatedTranscription ? " " : "") + data.text
+        session.logger.info(`Accumulated transcription: ${accumulatedTranscription}`)
+      }
+
       const searchParams = new URLSearchParams({ text: data.text, is_final: data.isFinal.toString() })
       const url = process.env.BACKEND_URL + "/current_transcription?" + searchParams.toString()
       await fetch(url, {
         method: "POST",
       })
       session.logger.info(`Transcription sent to backend: ${data.text}`)
-      if (data.isFinal && !aiTalking && currentEsiSessionId) {
-        const searchParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: data.text })
-        const url = process.env.BACKEND_URL + "/esi_chat?" + searchParams.toString()
-        aiTalking = true
-        await fetch(url, {
-          method: "POST",
-        })
-        aiTalking = false
-      }
+
+      // Submit to ESI session on final transcription (automatic submission)
+      // if (data.isFinal && !aiTalking && currentEsiSessionId) {
+      //   session.logger.info(`Auto-submitting final transcription to ESI session: ${data.text}`)
+      //   const chatParams = new URLSearchParams({ session_id: currentEsiSessionId, user_message: data.text })
+      //   const chatUrl = process.env.BACKEND_URL + "/esi_chat?" + chatParams.toString()
+      //   aiTalking = true
+      //   await fetch(chatUrl, {
+      //     method: "POST",
+      //   })
+      //   aiTalking = false
+      //   session.logger.info(`Final transcription auto-submitted to ESI session`)
+
+      //   // Clear the accumulated transcription since it was just submitted
+      //   accumulatedTranscription = ""
+      //   session.logger.info(`Accumulated transcription cleared after auto-submission`)
+      // }
     })
 
     const statusUnsubscribe = session.camera.onManagedStreamStatus((data) => {

@@ -135,7 +135,7 @@ export default function DemoPage() {
         <div className="absolute inset-0">
             <WebcamBackground />
             <div className="absolute inset-0 p-4">
-                <ol className="max-h-full overflow-y-auto">
+                <ul className="max-h-full overflow-y-auto">
                     {messages.map((msg, msgIndex) => {
                         if (!msg.parts.some(p => !p.type.startsWith('data-'))) return null
                         return (
@@ -164,7 +164,7 @@ export default function DemoPage() {
                     <li className={cn("text-foreground", { "opacity-70": !transcriptionIsFinal })}>
                         {transcription}
                     </li>
-                </ol>
+                </ul>
             </div>
         </div>
     )
