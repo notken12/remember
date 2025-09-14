@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from typing import List, Literal, TypedDict
+from typing import List, Literal, TypedDict, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -58,6 +58,101 @@ def prepare_video_context(clip_uuids: List[str]) -> List[MediaPart]:
             continue
 
     return media_parts
+
+
+# ---------------------------------------------------------------------
+# Phase 1: AgentGraphState schema and defaults (JSON-friendly)
+# ---------------------------------------------------------------------
+
+class QuestionState(TypedDict):
+    """Serializable cue-based question."""
+
+    text_cue: str
+    answer: str
+
+
+class QueueItemState(TypedDict):
+    """One scheduled spaced-retrieval task for a clip."""
+
+    clip_id: str
+    next_at: str  # ISO-8601
+    interval_index: int
+    attempt_count: int
+    questions: List[QuestionState]
+    meta: Dict[str, Any]
+
+
+class ActiveSessionExchange(TypedDict, total=False):
+    question: str
+    user: str
+    assessment: str
+
+
+class ActiveSessionState(TypedDict):
+    """Ongoing Q&A session state."""
+
+    clip_id: str
+    q_index: int
+    exchanges: List[ActiveSessionExchange]
+    interval_index: int
+    questions: List[QuestionState]
+    attempt_count: int
+
+
+class SRState(TypedDict, total=False):
+    """Top-level SR slice written into AgentGraphState."""
+
+    interval_seconds: List[int]
+    questions_per_clip: int
+    candidate_limit: int
+    selected_clips: List[str]
+    enqueued_clips: List[str]
+    clip_questions: Dict[str, List[QuestionState]]
+    queue: List[QueueItemState]
+    active_session: Optional[ActiveSessionState]
+    last_activity_at: str
+
+
+class AgentGraphState(TypedDict, total=False):
+    sr: SRState
+
+
+# Defaults and configurable keys
+DEFAULT_INTERVAL_SECONDS: List[int] = [30, 60, 120, 240]
+DEFAULT_QUESTIONS_PER_CLIP: int = 4
+DEFAULT_CANDIDATE_LIMIT: int = 20
+DEFAULT_VIDEO_TABLE: str = "videos"
+DEFAULT_VIDEO_TS_COLUMN: str = "time_created"
+
+
+def ensure_sr_slice(state: Dict[str, Any]) -> SRState:
+    """Ensure SR slice exists in AgentGraphState with sane defaults.
+
+    Returns the writable SRState dict contained within the provided state.
+    """
+    if "sr" not in state or not isinstance(state.get("sr"), dict):
+        state["sr"] = {}
+    sr: SRState = state["sr"]  # type: ignore[assignment]
+
+    # Initialize defaults if missing
+    if not isinstance(sr.get("interval_seconds"), list):
+        sr["interval_seconds"] = list(DEFAULT_INTERVAL_SECONDS)
+    if not isinstance(sr.get("questions_per_clip"), int):
+        sr["questions_per_clip"] = DEFAULT_QUESTIONS_PER_CLIP
+    if not isinstance(sr.get("candidate_limit"), int):
+        sr["candidate_limit"] = DEFAULT_CANDIDATE_LIMIT
+    if not isinstance(sr.get("selected_clips"), list):
+        sr["selected_clips"] = []
+    if not isinstance(sr.get("enqueued_clips"), list):
+        sr["enqueued_clips"] = []
+    if not isinstance(sr.get("clip_questions"), dict):
+        sr["clip_questions"] = {}
+    if not isinstance(sr.get("queue"), list):
+        sr["queue"] = []
+    if "active_session" not in sr:
+        sr["active_session"] = None
+
+    return sr
 
 
 async def main():
