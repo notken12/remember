@@ -5,11 +5,12 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, TypedDict, Dict, Any, Optional, Tuple, AsyncGenerator
+import logging
 
 from dotenv import load_dotenv
 from SRQuestionGenerator import QuestionGenerator
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import START, StateGraph
 from agent_state import State, get_state_from_supabase
@@ -25,6 +26,130 @@ from VideoClip import VideoClip
 
 load_dotenv()
 
+
+# ---------------------------------------------------------------------
+# Logging setup (file logging with media redaction utilities)
+# ---------------------------------------------------------------------
+
+_SR_LOGGER: Optional[logging.Logger] = None
+
+
+def _initialize_logger() -> logging.Logger:
+    global _SR_LOGGER
+    if _SR_LOGGER is not None:
+        return _SR_LOGGER
+    logger = logging.getLogger("sr_agent")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        log_path = os.getenv("SR_AGENT_LOG_FILE", "sr_agent.log")
+        try:
+            log_dir = os.path.dirname(log_path)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            # If directory creation fails, fall back to current directory
+            log_path = "sr_agent.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fmt = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+        # Avoid duplicate propagation to root
+        logger.propagate = False
+    _SR_LOGGER = logger
+    return logger
+
+
+def _sanitize_content_for_log(content: Any) -> Any:
+    # HumanMessage/SystemMessage content can be str or list of parts
+    try:
+        if isinstance(content, list):
+            sanitized_parts: List[Any] = []
+            for part in content:
+                if isinstance(part, dict):
+                    ptype = str(part.get("type", ""))
+                    if ptype == "media":
+                        sanitized_parts.append(
+                            {
+                                "type": "media",
+                                "mime_type": str(part.get("mime_type", "")),
+                                "data": "[media data redacted]",
+                            }
+                        )
+                    elif ptype == "text":
+                        sanitized_parts.append(
+                            {
+                                "type": "text",
+                                "text": str(part.get("text", "")),
+                            }
+                        )
+                    else:
+                        # Unknown part types: stringify
+                        sanitized_parts.append({"type": ptype or "unknown", "data": "[redacted/unknown part]"})
+                else:
+                    sanitized_parts.append(str(part))
+            return sanitized_parts
+        if isinstance(content, (str, int, float)):
+            return content
+        # Fallback
+        return str(content)
+    except Exception:
+        return "[unserializable content]"
+
+
+def _serialize_message_for_log(message: Any) -> Dict[str, Any]:
+    role = "unknown"
+    try:
+        if isinstance(message, SystemMessage):
+            role = "system"
+        elif isinstance(message, HumanMessage):
+            role = "human"
+        elif isinstance(message, AIMessage):
+            role = "ai"
+    except Exception:
+        role = "unknown"
+    try:
+        content = getattr(message, "content", "")
+    except Exception:
+        content = ""
+    return {
+        "role": role,
+        "content": _sanitize_content_for_log(content),
+    }
+
+
+def _log_llm_prompt(state: Dict[str, Any], when: str = "before_invoke") -> None:
+    try:
+        logger = _initialize_logger()
+    except Exception:
+        return
+    try:
+        messages = state.get("messages", []) or []
+        serialized = []
+        for m in messages:
+            try:
+                serialized.append(_serialize_message_for_log(m))
+            except Exception:
+                serialized.append({"role": "unknown", "content": "[unserializable message]"})
+        session_id = str(state.get("session_id", "unknown"))
+        try:
+            stage = get_stage(state)
+        except Exception:
+            stage = "unknown"
+        header = (
+            f"LLM Invocation ({when}) | session_id={session_id} | stage={stage} | messages={len(serialized)}"
+        )
+        logger.info(header)
+        try:
+            logger.info("Prompt (sanitized):\n%s", json.dumps(serialized, ensure_ascii=False, indent=2))
+        except Exception:
+            logger.info("Prompt (sanitized): [failed to serialize to JSON]")
+    except Exception:
+        # Never let logging crash the flow
+        pass
 
 # Validate environment variables (mirror esi_agent.py pattern)
 supabase_url = os.getenv("SUPABASE_URL")
@@ -781,6 +906,11 @@ class SRAgentRunner:
 
     async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
         state = get_state_from_supabase(self.session_id)
+        # Attach session id for logging context
+        try:
+            state["session_id"] = self.session_id
+        except Exception:
+            pass
         # Initialize config/defaults on sr slice
         configure_sr_from_env(state)
 
@@ -936,6 +1066,11 @@ class SRAgentRunner:
 
     async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
         state = get_state_from_supabase(self.session_id)
+        # Attach session id for logging context
+        try:
+            state["session_id"] = self.session_id
+        except Exception:
+            pass
         sr = ensure_sr_slice(state)
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
@@ -1132,6 +1267,11 @@ def sr_agent_node(state: State) -> State:
     This mirrors esi_agent.agent: we construct/bind the chat model and invoke it
     on state["messages"], then append the AI message back to the state's messages.
     """
+    # Log the prompt before invoking the LLM (media redacted)
+    try:
+        _log_llm_prompt(state, when="before_invoke")
+    except Exception:
+        pass
     llm = init_chat_model(
         model="gemini-2.5-flash",
         model_provider="google_genai",
