@@ -113,7 +113,7 @@ class MyMentraOSApp extends AppServer {
           session.logger.info(`Wake word detected, querying Assistant`)
           wakeWordDetected = true
           const searchParams = new URLSearchParams({ user_message: accumulatedTranscription })
-          const url = process.env.BACKEND_URL + "/assistant_session?" + searchParams.toString()
+          const url = process.env.BACKEND_URL + "/assistant_chat?" + searchParams.toString()
           aiTalking = true
           await fetch(url, {
             method: "POST",
