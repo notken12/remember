@@ -10,7 +10,7 @@ from SRQuestionGenerator import QuestionGenerator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
-from postgres import AsyncPostgresSaver
+# from postgres import AsyncPostgresSaver  # Lazily imported in _initialize_agent to avoid libpq issues in tests
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
 import uuid
@@ -121,6 +121,7 @@ class SRState(TypedDict, total=False):
     queue: List[QueueItemState]
     active_session: Optional[ActiveSessionState]
     last_activity_at: str
+    errors: List[str]
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -161,6 +162,8 @@ def ensure_sr_slice(state: Dict[str, Any]) -> SRState:
         sr["queue"] = []
     if "active_session" not in sr:
         sr["active_session"] = None
+    if not isinstance(sr.get("errors"), list):
+        sr["errors"] = []
 
     return sr
 
@@ -207,6 +210,23 @@ def configure_sr_from_env(state: Dict[str, Any]) -> None:
     # Video source configuration is read where discovery is performed; export defaults via env
     sr.setdefault("video_table", os.getenv("SR_VIDEO_TABLE", DEFAULT_VIDEO_TABLE))
     sr.setdefault("video_ts_column", os.getenv("SR_VIDEO_TS_COLUMN", DEFAULT_VIDEO_TS_COLUMN))
+
+
+def _log_sr_error(state: Dict[str, Any], msg: str, exc: Optional[BaseException] = None) -> None:
+    """Print and persist a timestamped SR error message in state."""
+    ts = datetime.utcnow().isoformat()
+    full = f"[SR][{ts}] {msg}"
+    try:
+        if exc is not None:
+            full = f"{full} | {type(exc).__name__}: {exc}"
+        print(full)
+    except Exception:
+        pass
+    sr = ensure_sr_slice(state)
+    errs = sr.get("errors", []) or []
+    errs.append(full)
+    # Keep last 50 for brevity
+    sr["errors"] = errs[-50:]
 
 
 # ---------------------------------------------------------------------
@@ -270,8 +290,8 @@ def load_recent_video_ids(state: Dict[str, Any]) -> List[str]:
         ids = [str(row["id"]) for row in data if row.get("id")]
         if ids:
             return _dedupe_preserve_order(ids)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_sr_error(state, f"Failed to load recent video ids ordered by {ts_col}", e)
 
     # Fallback ordering by created_at
     try:
@@ -282,7 +302,8 @@ def load_recent_video_ids(state: Dict[str, Any]) -> List[str]:
         data = resp.data or []
         ids = [str(row["id"]) for row in data if row.get("id")]
         return _dedupe_preserve_order(ids)
-    except Exception:
+    except Exception as e:
+        _log_sr_error(state, "Failed to load recent video ids by created_at", e)
         return []
 
 
@@ -480,25 +501,40 @@ class SRAgentRunner:
 
     def _initialize_agent(self):
         if self._checkpointer is None:
-            from psycopg import Connection
-            from psycopg.rows import dict_row
+            try:
+                from psycopg import Connection
+                from psycopg.rows import dict_row
+                from postgres import AsyncPostgresSaver  # lazy import here
 
-            conn = Connection.connect(
-                self.database_url,
-                autocommit=True,
-                prepare_threshold=0,
-                row_factory=dict_row,
-                connect_timeout=30,
-                options="-c statement_timeout=300000",
-            )
-            self._checkpointer = AsyncPostgresSaver(conn, None)
-            self._checkpointer._conn_string = self.database_url
-
-            self._agent = create_react_agent(
-                model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
-                tools=[],
-                checkpointer=self._checkpointer,
-            )
+                conn = Connection.connect(
+                    self.database_url,
+                    autocommit=True,
+                    prepare_threshold=0,
+                    row_factory=dict_row,
+                    connect_timeout=30,
+                    options="-c statement_timeout=300000",
+                )
+                self._checkpointer = AsyncPostgresSaver(conn, None)
+                self._checkpointer._conn_string = self.database_url
+                self._agent = create_react_agent(
+                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
+                    tools=[],
+                    checkpointer=self._checkpointer,
+                )
+            except Exception as e:
+                # Log fallback so it's visible during tests/dev
+                try:
+                    print(f"[SR] Falling back to in-memory state (no Postgres checkpointer): {type(e).__name__}: {e}")
+                except Exception:
+                    pass
+                # Fallback to agent without external checkpointer; keep an in-memory state copy
+                self._memory_state: Dict[str, Any] = {}
+                self._checkpointer = None
+                self._agent = create_react_agent(
+                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
+                    tools=[],
+                    checkpointer=None,
+                )
 
     def __del__(self):
         if self._checkpointer and hasattr(self._checkpointer, "conn"):
@@ -508,8 +544,13 @@ class SRAgentRunner:
                 pass
 
     def _get_state(self) -> Dict[str, Any]:
-        snapshot = self._agent.get_state(self.config)
-        state = snapshot.values
+        try:
+            snapshot = self._agent.get_state(self.config)
+            state = snapshot.values
+        except Exception:
+            state = {}
+        if not state and hasattr(self, "_memory_state"):
+            state = self._memory_state
         if "sr" not in state or not isinstance(state.get("sr"), dict):
             state["sr"] = {}
         return state
@@ -526,6 +567,8 @@ class SRAgentRunner:
             fb = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
             if fb:
                 candidates = _dedupe_preserve_order([cid.strip() for cid in fb.split(",") if cid.strip()])
+            if not candidates:
+                _log_sr_error(state, "No candidate clips found (Supabase and fallback empty)")
         sr = ensure_sr_slice(state)
         max_clips = int(sr.get("max_clips", 3))
         selected = select_first_n(candidates, n=max_clips)
@@ -544,6 +587,7 @@ class SRAgentRunner:
                     {"text_cue": str(q.text_cue), "answer": str(q.answer)} for q in questions_objs
                 ]
                 if not questions:
+                    _log_sr_error(state, f"No questions generated for clip {cid}")
                     continue
                 # Cache
                 cq = sr.get("clip_questions", {}) or {}
@@ -552,7 +596,8 @@ class SRAgentRunner:
                 # Enqueue
                 enqueue(state, clip_id=cid, questions=questions, interval_index=0, base_time=now, attempt_count=0)
                 sr["enqueued_clips"].append(cid)
-            except Exception:
+            except Exception as e:
+                _log_sr_error(state, f"Failed to prepare questions/enqueue for {cid}", e)
                 continue
 
         # If an item is due now, start session and attach media
@@ -577,6 +622,8 @@ class SRAgentRunner:
             ]
         else:
             n = len(sr.get("enqueued_clips", []))
+            if n == 0:
+                _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
             human_content = [
                 {"type": "text", "text": f"We will practice recall for {n} short clips. Greet briefly and ask if they are ready to begin."},
             ]
