@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import sys
 
-import google.generativeai as genai
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from VideoClip import VideoClip
@@ -45,20 +44,23 @@ class ESIAgent:
     ) -> None:
         self.supabase_url: str = os.getenv("SUPABASE_URL", "")
         self.supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-        
-        self.gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+
+        self.gemini_api_key: str = os.getenv("GOOGLE_API_KEY", "")
         self.model_name: str = "gemini-2.5-flash"
-        self.table_name: str = "test_videos"
+        self.table_name: str = "videos"
         # Default to created_at but permit override via CLI; keep legacy compat
         self.timestamp_column: str = "time_created"
         # Context mode: "video" | "annotation"
         if not self.supabase_url or not self.supabase_service_role_key:
-            raise ValueError("Supabase credentials are required (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)")
+            raise ValueError(
+                "Supabase credentials are required (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)"
+            )
         if not self.gemini_api_key:
-            raise ValueError("GEMINI_API_KEY is required")
+            raise ValueError("GOOGLE_API_KEY is required")
 
-        self.supabase: Client = create_client(self.supabase_url, self.supabase_service_role_key)
-        genai.configure(api_key=self.gemini_api_key)
+        self.supabase: Client = create_client(
+            self.supabase_url, self.supabase_service_role_key
+        )
         # Keep selected memories and prepared video handles for downstream use
         self.memories_context: List[Dict[str, Any]] = []
         self.video_files_context: List[Any] = []
@@ -69,7 +71,9 @@ class ESIAgent:
         self.session: Optional["ChatSession"] = session
         if self.session is None and session_id:
             if ChatSession is None:
-                raise RuntimeError("ChatSession module not available for session initialization")
+                raise RuntimeError(
+                    "ChatSession module not available for session initialization"
+                )
             self.session = ChatSession(session_id=session_id)
 
         else:
@@ -98,8 +102,7 @@ class ESIAgent:
         Returns a list of dicts with keys: id, annotation, created_at (if present).
         """
         query = (
-            self.supabase
-            .table(self.table_name)
+            self.supabase.table(self.table_name)
             .select("id, annotation, {}".format(self.timestamp_column))
             .not_.is_("annotation", "null")
             .neq("annotation", "")
@@ -133,7 +136,9 @@ class ESIAgent:
             )
         return normalized
 
-    def _build_esi_instruction(self, candidates: Sequence[Dict[str, Any]], max_items: int) -> str:
+    def _build_esi_instruction(
+        self, candidates: Sequence[Dict[str, Any]], max_items: int
+    ) -> str:
         """
         Build the instruction for ESI selection with an explicit output contract.
         """
@@ -183,20 +188,20 @@ class ESIAgent:
             return []
 
         prompt = self._build_esi_instruction(candidates, max_items=max_items)
-        model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config={
-                "response_mime_type": "application/json",
-            },
+        if ChatGoogleGenerativeAI is None or SystemMessage is None:
+            raise RuntimeError(
+                "LangChain Google GenAI dependencies are not available. Install langchain-google-genai."
+            )
+        if self.llm is None:
+            raise RuntimeError("LLM not initialized")
+        system_msg = SystemMessage(
+            content=(
+                'Return ONLY JSON: an array of {"uuid": string, "reasoning": string}. No extra text.'
+            )
         )
-
-        response = model.generate_content(prompt)
-        text = getattr(response, "text", None) or getattr(response, "candidates", None)
-        if isinstance(text, list):
-            # Fallback if SDK returns structured candidates; stringify conservatively
-            text = "".join([getattr(c, "content", "") for c in text])
-        if not isinstance(text, str):
-            raise RuntimeError("Model did not return text content")
+        human_msg = HumanMessage(content=prompt)
+        ai_response = self.llm.invoke([system_msg, human_msg])
+        text = getattr(ai_response, "content", "")
 
         try:
             parsed = json.loads(text)
@@ -217,7 +222,9 @@ class ESIAgent:
             reasoning_val = item.get("reasoning") or item.get("rationale")
             if not uuid_val or not reasoning_val:
                 continue
-            results.append({"uuid": str(uuid_val), "reasoning": str(reasoning_val).strip()})
+            results.append(
+                {"uuid": str(uuid_val), "reasoning": str(reasoning_val).strip()}
+            )
 
         # Enforce max_items cap client-side as well
         return results[:max_items]
@@ -238,7 +245,9 @@ class ESIAgent:
             start_time_iso=start_time_iso, end_time_iso=end_time_iso, limit=limit
         )
         # Map annotations by uuid for later augmentation
-        uuid_to_annotation: Dict[str, str] = {str(c["uuid"]): str(c.get("annotation", "")) for c in candidates}
+        uuid_to_annotation: Dict[str, str] = {
+            str(c["uuid"]): str(c.get("annotation", "")) for c in candidates
+        }
         print(f"🗂️ Selecting up to {max_items} memories via Gemini...")
         selected = self.select_memories(candidates, max_items=max_items)
         try:
@@ -254,15 +263,18 @@ class ESIAgent:
         self.memories_context = selected
         # Prepare actual video context via VideoClip utilities
         try:
-            print("📦 Preparing video context (uploading to Gemini for LangChain media parts)...")
-            self._prepare_video_context_with_videoclips([item["uuid"] for item in selected])
+            print(
+                "📦 Preparing video context (uploading to Gemini for LangChain media parts)..."
+            )
+            self._prepare_video_context_with_videoclips(
+                [item["uuid"] for item in selected]
+            )
         except Exception as e:
             self.video_files_context = []
             print(f"⚠️ Failed to prepare video context; proceeding without videos: {e}")
         return selected
 
     def _prepare_video_context_with_videoclips(self, uuids: Sequence[str]) -> None:
-        uploaded: List[Any] = []
         lc_parts: List[Dict[str, Any]] = []
         try:
             print(f"⬆️ Uploading {len(list(uuids))} videos to Gemini...")
@@ -271,25 +283,13 @@ class ESIAgent:
         for uuid_val in uuids:
             try:
                 clip = VideoClip(uuid_val)
-                # Prepare Gemini file for non-LangChain direct calls (kept for compatibility)
-                tmp_path = clip.download_to_tempfile()
+                media_part, temp_path = clip.make_langchain_media_part()
+                lc_parts.append(media_part)
                 try:
-                    file_handle = clip.upload_to_gemini(tmp_path)
-                    uploaded.append(file_handle)
-                finally:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.unlink(tmp_path)
-                    except Exception:
-                        pass
-                # Prepare LangChain media part using uploaded file URI/name
-                file_uri = getattr(file_handle, "uri", None) or getattr(file_handle, "name", None)
-                if file_uri:
-                    lc_parts.append({
-                        "type": "media",
-                        "mime_type": "video/mp4",
-                        "file_uri": file_uri,
-                    })
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                except Exception:
+                    pass
                 try:
                     print(f"   ✅ Prepared media part for {uuid_val}")
                 except Exception:
@@ -301,14 +301,16 @@ class ESIAgent:
                 except Exception:
                     pass
                 continue
-        self.video_files_context = uploaded
+        self.video_files_context = []
         # Replace any previous cache
         # Note: temp paths will be cleaned after chat loop ends or on agent reinit
         self._langchain_media_parts = lc_parts
         try:
             count = len(lc_parts)
-            sample = (lc_parts[0].get("file_uri") if count else None)
-            print(f"✅ Prepared {count} video media parts for LangChain. Sample URI: {sample}")
+            sample = lc_parts[0].get("file_uri") if count else None
+            print(
+                f"✅ Prepared {count} video media parts for LangChain. Sample URI: {sample}"
+            )
         except Exception:
             pass
 
@@ -341,7 +343,9 @@ class ESIAgent:
 
     def _ensure_session_saved(self) -> None:
         if self.session is None:
-            raise ValueError("Chat session is not initialized. Provide session or session_id to ESIAgent.")
+            raise ValueError(
+                "Chat session is not initialized. Provide session or session_id to ESIAgent."
+            )
         try:
             # Best-effort: safe to call even if already exists; ignore failure
             self.session.save_to_supabase()
@@ -354,7 +358,9 @@ class ESIAgent:
         Requires LangChain + Gemini and an initialized ChatSession.
         """
         if ChatGoogleGenerativeAI is None or SystemMessage is None:
-            raise RuntimeError("LangChain Google GenAI dependencies are not available. Install langchain-google-genai.")
+            raise RuntimeError(
+                "LangChain Google GenAI dependencies are not available. Install langchain-google-genai."
+            )
         if self.llm is None:
             raise RuntimeError("LLM not initialized")
         self._ensure_session_saved()
@@ -380,15 +386,24 @@ class ESIAgent:
         if self._langchain_media_parts:
             # Compose turn with attached videos
             user_content: List[Dict[str, Any]] = []
-            user_content.append({"type": "text", "text": "Use attached clips as gentle cues (do not force)."})
+            user_content.append(
+                {
+                    "type": "text",
+                    "text": "Use attached clips as gentle cues (do not force).",
+                }
+            )
             for part in self._langchain_media_parts:
                 user_content.append(part)
             user_content.append({"type": "text", "text": user_text})
             try:
-                print(f"📎 Attaching {len(self._langchain_media_parts)} video media parts to this chat turn")
+                print(
+                    f"📎 Attaching {len(self._langchain_media_parts)} video media parts to this chat turn"
+                )
             except Exception:
                 pass
-            messages: List[Any] = [system_msg] + history_msgs + [HumanMessage(content=user_content)]
+            messages: List[Any] = (
+                [system_msg] + history_msgs + [HumanMessage(content=user_content)]
+            )
         else:
             # Fallback to textual memory annotations context
             raise ValueError("No video media parts available for therapist chat")
@@ -410,16 +425,19 @@ class ESIAgent:
             raise RuntimeError("ChatMessage module not available for persistence")
         assert self.session is not None
         try:
-            ChatMessage(content=user_text, session_id=self.session.id, role="user").save_to_supabase()
+            ChatMessage(
+                content=user_text, session_id=self.session.id, role="user"
+            ).save_to_supabase()
         except Exception:
             pass
         try:
-            ChatMessage(content=ai_text, session_id=self.session.id, role="assistant").save_to_supabase()
+            ChatMessage(
+                content=ai_text, session_id=self.session.id, role="assistant"
+            ).save_to_supabase()
         except Exception:
             pass
 
         return ai_text
-
 
     def kickoff(self) -> str:
         """
@@ -428,7 +446,9 @@ class ESIAgent:
         Persists only the assistant message (no synthetic user prompt is saved).
         """
         if ChatGoogleGenerativeAI is None or SystemMessage is None:
-            raise RuntimeError("LangChain Google GenAI dependencies are not available. Install langchain-google-genai.")
+            raise RuntimeError(
+                "LangChain Google GenAI dependencies are not available. Install langchain-google-genai."
+            )
         if self.llm is None:
             raise RuntimeError("LLM not initialized")
         self._ensure_session_saved()
@@ -444,14 +464,21 @@ class ESIAgent:
             "(e.g., lighting, a sound, an object, or who was there)."
         )
         user_content: List[Dict[str, Any]] = []
-        user_content.append({"type": "text", "text": "Use attached clips as gentle cues (do not force)."})
+        user_content.append(
+            {
+                "type": "text",
+                "text": "Use attached clips as gentle cues (do not force).",
+            }
+        )
         for part in self._langchain_media_parts:
             user_content.append(part)
         # Add the kickoff directive as text so the model initiates
         user_content.append({"type": "text", "text": kickoff_text})
 
         try:
-            print(f"🟢 Kickoff: attaching {len(self._langchain_media_parts)} video media parts and requesting therapist to start")
+            print(
+                f"🟢 Kickoff: attaching {len(self._langchain_media_parts)} video media parts and requesting therapist to start"
+            )
         except Exception:
             pass
 
@@ -464,7 +491,9 @@ class ESIAgent:
             raise RuntimeError("ChatMessage module not available for persistence")
         assert self.session is not None
         try:
-            ChatMessage(content=ai_text, session_id=self.session.id, role="assistant").save_to_supabase()
+            ChatMessage(
+                content=ai_text, session_id=self.session.id, role="assistant"
+            ).save_to_supabase()
         except Exception:
             pass
 
@@ -491,26 +520,58 @@ def _parse_iso_or_none(value: Optional[str]) -> Optional[str]:
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="ESI memory extractor and therapist chat")
+
+    parser = argparse.ArgumentParser(
+        description="ESI memory extractor and therapist chat"
+    )
     parser.add_argument("--start", dest="start", help="ISO start time (inclusive)")
     parser.add_argument("--end", dest="end", help="ISO end time (inclusive)")
-    parser.add_argument("--limit", dest="limit", type=int, help="Max candidates to fetch before selection")
     parser.add_argument(
-        "--max", dest="max_items", type=int, default=10, help="Max items to return after selection"
+        "--limit",
+        dest="limit",
+        type=int,
+        help="Max candidates to fetch before selection",
     )
     parser.add_argument(
-        "--model", dest="model_name", default="gemini-2.5-flash", help="Gemini model name"
+        "--max",
+        dest="max_items",
+        type=int,
+        default=10,
+        help="Max items to return after selection",
     )
     parser.add_argument(
-        "--table", dest="table_name", default="test_videos", help="Supabase table holding videos"
+        "--model",
+        dest="model_name",
+        default="gemini-2.5-flash",
+        help="Gemini model name",
     )
     parser.add_argument(
-        "--ts-col", dest="timestamp_column", default="time_created", help="Timestamp column for filtering"
+        "--table",
+        dest="table_name",
+        default="videos",
+        help="Supabase table holding videos",
+    )
+    parser.add_argument(
+        "--ts-col",
+        dest="timestamp_column",
+        default="time_created",
+        help="Timestamp column for filtering",
     )
     # Chat mode
-    parser.add_argument("--session-id", dest="session_id", help="Chat session UUID for persistence")
-    parser.add_argument("--chat", dest="chat_text", help="Send a single user message and print therapist reply")
-    parser.add_argument("--interactive", action="store_true", default=True, help="Start an interactive ESI therapist chat loop")
+    parser.add_argument(
+        "--session-id", dest="session_id", help="Chat session UUID for persistence"
+    )
+    parser.add_argument(
+        "--chat",
+        dest="chat_text",
+        help="Send a single user message and print therapist reply",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=True,
+        help="Start an interactive ESI therapist chat loop",
+    )
 
     args = parser.parse_args()
 
@@ -567,5 +628,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

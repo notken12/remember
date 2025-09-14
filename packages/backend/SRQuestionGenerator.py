@@ -7,8 +7,9 @@ import tempfile
 import time
 from typing import List, Optional
 
-import google.generativeai as genai  # type: ignore
 from dotenv import load_dotenv  # type: ignore
+from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+from langchain_core.messages import HumanMessage  # type: ignore
 
 from VideoClip import VideoClip
 from Question import Question
@@ -27,37 +28,22 @@ class QuestionGenerator:
     fields `text_cue` and `answer`.
     """
 
-    def __init__(self, video_clip: VideoClip, model_name: str = "gemini-2.5-flash-lite"):
+    def __init__(
+        self, video_clip: VideoClip, model_name: str = "gemini-2.5-flash-lite"
+    ):
         self.video_clip = video_clip
         self.model_name = model_name
         self.questions: List[Question] = []
 
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        gemini_api_key = os.getenv("GOOGLE_API_KEY")
         if not gemini_api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required")
-        genai.configure(api_key=gemini_api_key)
+            raise ValueError("GOOGLE_API_KEY environment variable is required")
 
-    def _upload_video_to_gemini(self, video_bytes: bytes):
+    def _make_media_part(self, video_bytes: bytes) -> dict:
         """
-        Upload bytes as a temporary .mp4 file to Gemini and wait for processing.
-        Returns the uploaded file handle usable in `generate_content`.
+        Build a LangChain-compatible media content part from raw video bytes.
         """
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp.write(video_bytes)
-            tmp_path = tmp.name
-
-        try:
-            video_file = genai.upload_file(path=tmp_path, mime_type="video/mp4")
-            while getattr(video_file, "state", None) and getattr(video_file.state, "name", "") == "PROCESSING":
-                print("Processing video for questions...")
-                time.sleep(2)
-                video_file = genai.get_file(video_file.name)
-            if getattr(video_file, "state", None) and getattr(video_file.state, "name", "") == "FAILED":
-                raise RuntimeError("Video processing failed for question generation")
-            return video_file
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+        return {"type": "media", "mime_type": "video/mp4", "data": video_bytes}
 
     def _build_prompt(self, desired_count: int) -> str:
         """
@@ -117,7 +103,10 @@ Respond with STRICT JSON only, no Markdown, no commentary. Use this schema:
                 # Last resort: extract array and wrap
                 arr_match = re.search(r"\[[\s\S]*\]", cleaned)
                 if arr_match:
-                    return {"video_id": self.video_clip.id, "questions": json.loads(arr_match.group(0))}
+                    return {
+                        "video_id": self.video_clip.id,
+                        "questions": json.loads(arr_match.group(0)),
+                    }
                 raise
 
     def generate(self, num_questions: int = 6) -> List[Question]:
@@ -130,20 +119,22 @@ Respond with STRICT JSON only, no Markdown, no commentary. Use this schema:
             # Fetch raw video bytes from Supabase via the VideoClip helper
             video_bytes = self.video_clip._fetch_video_from_supabase()
 
-            # Upload to Gemini and build prompt
-            video_file = self._upload_video_to_gemini(video_bytes)
+            # Build media part and prompt
+            media_part = self._make_media_part(video_bytes)
             prompt = self._build_prompt(num_questions)
 
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config={"response_mime_type": "application/json"},
+            llm = ChatGoogleGenerativeAI(
+                model=self.model_name,
+                google_api_key=os.getenv("GOOGLE_API_KEY", ""),
             )
-
-            response = model.generate_content([video_file, prompt])
-            payload = self._extract_json(response.text)
+            content = [media_part, {"type": "text", "text": prompt}]
+            ai = llm.invoke([HumanMessage(content=content)])
+            payload = self._extract_json(getattr(ai, "content", ""))
 
             # Support either a dict {{video_id, questions:[...]}} or a bare array
-            items = payload.get("questions", payload if isinstance(payload, list) else [])
+            items = payload.get(
+                "questions", payload if isinstance(payload, list) else []
+            )
 
             self.questions = [
                 Question(
@@ -198,5 +189,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

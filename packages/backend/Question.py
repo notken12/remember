@@ -64,7 +64,7 @@ class Question:
             print(f"   Answer: {self.answer[:50]}..." if len(self.answer) > 50 else f"   Answer: {self.answer}")
             
             # Insert the question record into the database
-            response = self.supabase.table('test_questions').insert({
+            response = self.supabase.table('questions').insert({
                 'video_id': self.video_clip.id,
                 'text_cue': self.text_cue,
                 'answer': self.answer
