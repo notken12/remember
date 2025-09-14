@@ -312,6 +312,7 @@ class SRAgent:
         self._clip_questions: Dict[str, List[Question]] = {}
         # Deterministic subset chosen for this SR run
         self._selected_clips: List[str] = []
+        self._enqueued_clips: List[str] = []
         # Active session state (None or dict-like mirror of ActiveSessionState)
         self._active_session: Optional[Dict[str, Any]] = None
         # Timestamps and misc
@@ -527,6 +528,7 @@ class SRAgent:
             selected = []
 
         self._selected_clips = list(selected)
+        self._enqueued_clips = []
 
         # Prepare questions per selected clip (cached when possible)
         questions_map: Dict[str, List[Question]] = {}
@@ -553,6 +555,7 @@ class SRAgent:
                     meta={},
                 )
                 enqueued_count += 1
+                self._enqueued_clips.append(cid)
             except Exception:
                 # Skip enqueue failures to avoid blocking all clips
                 continue
@@ -837,6 +840,7 @@ class SRAgent:
         interval_index: int = 0,
         base_time: Optional[datetime] = None,
         meta: Optional[Dict[str, Any]] = None,
+        attempt_count: int = 0,
     ) -> None:
         """Add a clip to the priority queue for spaced retrieval.
 
@@ -846,6 +850,7 @@ class SRAgent:
             interval_index: Which interval step to schedule next (0-based).
             base_time: Reference time for scheduling; defaults to "now".
             meta: Optional metadata (e.g., HUD time bounds) to attach to the queue item.
+            attempt_count: Number of prior attempts for this clip in this run.
 
         Raises:
             ValueError: If `interval_index` is outside the supported schedule.
@@ -873,7 +878,7 @@ class SRAgent:
             questions=list(questions),
             next_at=next_at,
             interval_index=interval_index,
-            attempt_count=0,
+            attempt_count=int(attempt_count) if attempt_count >= 0 else 0,
             meta=dict(meta) if meta else {},
         )
 
@@ -1109,6 +1114,7 @@ class SRAgent:
                 questions,
                 interval_index=next_index,
                 base_time=reference_time,
+                attempt_count=(self._active_session.get("attempt_count", 0) + 1) if self._active_session else 1,
             )
         except Exception:
             # Best-effort: if re-enqueue fails, skip silently to avoid breaking the loop
@@ -1233,6 +1239,7 @@ class SRAgent:
                 "exchanges": list(active.get("exchanges", [])) if isinstance(active.get("exchanges", []), list) else [],
                 "interval_index": int(active.get("interval_index", 0)),
                 "questions": list(active.get("questions", [])) if isinstance(active.get("questions", []), list) else [],
+                "attempt_count": int(active.get("attempt_count", 0)),
             }
         else:
             self._active_session = None
@@ -1302,6 +1309,9 @@ class SRAgent:
         # last_activity_at
         if self._last_activity_at:
             sr["last_activity_at"] = self._last_activity_at.isoformat()
+
+        # Enqueued clips (auxiliary for debugging/UX)
+        sr["enqueued_clips"] = list(getattr(self, "_enqueued_clips", []))
 
         # Write back to graph_state
         state["sr"] = sr
