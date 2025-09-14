@@ -69,7 +69,8 @@ I designed the overall algorithms and approach we took. I focused on building th
 
 ### Samarth: 
 I built both the Episodic Specificity Induction (ESI) and general assistant agents. Specifically, I specced out the agent workflows, ported functionality to Langgraph, and used Cerebras to speed up inference, yielding smooth conversation. I also created the base backend infrastructure for video storage and chat messages/sessions.
-Challenges we ran into
+
+## Challenges we ran into
 
 We chose to use LangGraph for its ability to automatically persist agent graph state such as conversation history to our Postgres database. However, we experienced significant issues with the library’s builtin Postgres “checkpointer” and it often failed to write into the database. We ultimately decided to write our own message database schema and code to save messages after each LLM inference and tool call result, as well as retrieve session data when chatting in existing sessions. 
 
