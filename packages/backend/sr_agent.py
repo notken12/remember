@@ -671,6 +671,19 @@ def enqueue(
         raise ValueError("interval_index out of range")
     reference = _to_naive_utc(base_time or datetime.utcnow())
     next_at = reference + timedelta(seconds=int(intervals[interval_index]))
+    # Debug logging for enqueue
+    try:
+        _initialize_logger().info(
+            "[DEBUG] Enqueue: clip_id=%s interval_index=%d attempt_count=%d base_time=%s next_at=%s queue_len_before=%d",
+            clip_id,
+            int(interval_index),
+            int(attempt_count),
+            _to_iso(reference),
+            _to_iso(next_at),
+            len(sr.get("queue", []) or []),
+        )
+    except Exception:
+        pass
     item: QueueItemState = {
         "clip_id": clip_id,
         "next_at": _to_iso(next_at),
@@ -682,6 +695,14 @@ def enqueue(
     q = sr.get("queue", []) or []
     q.append(item)
     sr["queue"] = q
+    try:
+        _initialize_logger().info(
+            "[DEBUG] Enqueue done: queue_len_after=%d head_next_at=%s",
+            len(q),
+            (q[0].get("next_at") if len(q) > 0 else "<empty>")
+        )
+    except Exception:
+        pass
 
 
 def _head_due_index(q: List[QueueItemState], now_dt: datetime) -> Optional[int]:
@@ -964,6 +985,20 @@ def reschedule(
     intervals = sr.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
     last_index = len(intervals) - 1
     cur_idx = int(sess.get("interval_index", 0))
+    # Debug: capture pre-reschedule state
+    try:
+        _initialize_logger().info(
+            "[DEBUG] Reschedule start: clip_id=%s success=%s cur_idx=%d last_idx=%d attempt_count=%d queue_len_before=%d intervals=%s",
+            str(sess.get("clip_id", "")),
+            str(bool(success)),
+            cur_idx,
+            last_index,
+            int(sess.get("attempt_count", 0)),
+            len(sr.get("queue", []) or []),
+            ",".join(str(x) for x in intervals),
+        )
+    except Exception:
+        pass
     if success:
         next_idx = min(cur_idx + 1, last_index)
     else:
@@ -971,18 +1006,36 @@ def reschedule(
     attempt = int(sess.get("attempt_count", 0)) + 1
     clip_id = str(sess.get("clip_id", ""))
     questions = list(sess.get("questions", []))
+    # Compute next_at for logging
+    planned_time = _to_naive_utc(now or datetime.utcnow())
+    try:
+        planned_next_at = planned_time + timedelta(seconds=int(intervals[next_idx]))
+        planned_next_at_iso = _to_iso(planned_next_at)
+    except Exception:
+        planned_next_at_iso = "<error>"
     enqueue(
         state,
         clip_id=clip_id,
         questions=questions,
         interval_index=next_idx,
-        base_time=now or datetime.utcnow(),
+        base_time=planned_time,
         attempt_count=attempt,
     )
     sr["active_session"] = None
     # Make stage explicit for idle/waiting state
     try:
         set_stage(state, "waiting")
+    except Exception:
+        pass
+    # Debug: capture post-reschedule state
+    try:
+        _initialize_logger().info(
+            "[DEBUG] Reschedule done: next_idx=%d queued_next_at=%s queue_len_after=%d stage=%s",
+            int(next_idx),
+            planned_next_at_iso,
+            len(sr.get("queue", []) or []),
+            get_stage(state),
+        )
     except Exception:
         pass
 
