@@ -66,7 +66,8 @@ def _build_system_prompt() -> str:
         "- Ask only one follow-up question.\n"
         "- Prefer simple, concrete language.\n"
         "- If memory is vague, offer options (e.g., sights, sounds, people) and let the patient choose.\n"
-        "- If stuck, suggest a tiny step (notice lighting, a color, a voice).\n"
+        "- If stuck, suggest a tiny step (notice lighting, a color, a voice).\n\n"
+        "Tool use: If a specific clip clearly answers the patient's immediate question, call the tool `select_video` exactly once with that clip's UUID so the app can display it. Always include one brief sentence of context describing what/where the clip shows. Only use UUIDs from the provided list; never make up IDs."
     )
 
 
@@ -234,14 +235,55 @@ def end_esi_session() -> None:
     return None
 
 
-tools = [end_esi_session]
+@tool
+def select_video(video_uuid: str) -> Dict[str, str]:
+    """Request the client to display a specific video by returning its public URL.
+
+    Returns: {"public_url": <url>} or {"public_url": "", "error": <msg>}
+    """
+    try:
+        resp = (
+            supabase.table("videos")
+            .select("video_path")
+            .eq("id", video_uuid)
+            .single()
+            .execute()
+        )
+        row = (resp.data or {}) if hasattr(resp, "data") else resp
+        video_path = row.get("video_path") if isinstance(row, dict) else None
+        if not video_path:
+            return {"public_url": "", "error": "video_path not found"}
+
+        public_info = None
+        try:
+            public_info = supabase.storage.from_("videos").get_public_url(video_path)
+        except Exception:
+            public_info = None
+
+        public_url = None
+        if isinstance(public_info, dict):
+            public_url = (
+                public_info.get("data", {}).get("publicUrl")
+                or public_info.get("publicUrl")
+                or public_info.get("public_url")
+            )
+        if not public_url:
+            base = os.getenv("SUPABASE_URL", "").rstrip("/")
+            public_url = f"{base}/storage/v1/object/public/videos/{video_path}" if base else ""
+
+        return {"public_url": str(public_url)}
+    except Exception as e:
+        return {"public_url": "", "error": str(e)}
+
+
+TOOL_LIST = [end_esi_session, select_video]
 
 
 def agent(state: State) -> State:
     llm = init_chat_model(
         model="gemini-2.5-flash",
         model_provider="google_genai",
-    ).bind_tools(tools)
+    ).bind_tools(TOOL_LIST)
     # LLM expects a list of messages, not the entire state
     message = llm.invoke(state["messages"])
     state["messages"].append(message)
@@ -256,15 +298,27 @@ def agent(state: State) -> State:
     return state
 
 
-def tools(state: State) -> State:
-    node = ToolNode(tools=tools)
-    tool_calls = node.invoke(state)
+def tools_node(state: State) -> State:
+    node = ToolNode(tools=TOOL_LIST)
+    tool_output = node.invoke(state)
+    if isinstance(tool_output, dict) and "messages" in tool_output:
+        tool_calls = tool_output.get("messages", [])
+    else:
+        tool_calls = tool_output
+    if not isinstance(tool_calls, list):
+        tool_calls = [tool_calls]
     state["messages"].extend(tool_calls)
     for tool_call in tool_calls:
+        data_payload = getattr(tool_call, "__dict__", None)
+        if data_payload is None:
+            if isinstance(tool_call, dict):
+                data_payload = tool_call
+            else:
+                data_payload = {"content": str(getattr(tool_call, "content", tool_call))}
         supabase.table("chat_messages").insert(
             {
                 "role": "tool",
-                "data": tool_call.__dict__,
+                "data": data_payload,
                 "session_id": str(state["session_id"]),  # Ensure session_id is string
             }
         ).execute()
@@ -273,7 +327,7 @@ def tools(state: State) -> State:
 
 graph_builder = StateGraph(State)
 graph_builder.add_node("agent", agent)
-graph_builder.add_node("tools", tools)
+graph_builder.add_node("tools", tools_node)
 graph_builder.add_edge(START, "agent")
 graph_builder.add_conditional_edges("agent", tools_condition)
 graph_builder.add_edge("tools", "agent")
@@ -284,7 +338,7 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
     """Start the therapy session with therapist speaking first."""
     system_prompt = _build_system_prompt()
 
-    kickoff_message = "Finally, greet the patient warmly and ask ONE gentle, concrete recall question based on the prepared memories."
+    kickoff_message = "Finally, greet the patient warmly and ask ONE gentle, concrete recall question based on the prepared memories. If a specific clip clearly answers the patient's immediate question, call select_video exactly once with that clip's UUID and also provide one short sentence describing what/where it shows."
 
     print("Extracting memories...")
     videos = extract_memories()
@@ -296,10 +350,13 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
             {"type": "text", "text": kickoff_message},
             {
                 "type": "text",
-                "text": "\n\nHere are video memories from the patient's smart glasses to help guide your questions:",
+                "text": "\n\nHere are video memories from the patient's smart glasses to help guide your questions (each shows its UUID in brackets):",
             },
             *[
-                {"type": "text", "text": f"Memory {i + 1}: {video['annotation']}"}
+                {
+                    "type": "text",
+                    "text": f"Memory {i + 1} [{video['uuid']}]: {video['annotation']}",
+                }
                 for i, video in enumerate(videos)
             ],
             # *video_media_parts,
