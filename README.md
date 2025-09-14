@@ -10,7 +10,7 @@ When we heard of this issue, an obvious solution came to mind; if diarying doesn
 
 Since Sensecam, almost no one has dared to take on Alzheimer's in the visual space. With the rise of smart glasses and artificial intelligence, we saw a massive hole in this space. The rest is in the details: using SoTA Alzheimer’s research to design specific training curricula using artificial intelligence, designing multi-agent workflows that facilitate this research, and creating engaging conversation using Cerebras’ blazing fast inference.
 
-##What it does
+## What it does
 
 Our system can primarily be split up into 3 agents, that together facilitate the autobiographical rehabilitation process for the patient, and/or increase quality of life.
 
@@ -61,11 +61,14 @@ Though most users would choose to engage with our therapy experience in a quiet 
 ## Individual Contributions
 We were a team of three so we had constant communication and worked together extensively. However, here are the general areas in which we each focused. 
 
-### Ken: I mainly worked on the MentraOS app, front-end HUD, streaming, and integrating everything (glasses, frontend, backend, database, etc.) together using API routes and pub-sub. I did a deep dive into MentraOS’s abilities and limitations and used what I learned to architect the overall structure of our project and the frameworks we used.
+### Ken: 
+I mainly worked on the MentraOS app, front-end HUD, streaming, and integrating everything (glasses, frontend, backend, database, etc.) together using API routes and pub-sub. I did a deep dive into MentraOS’s abilities and limitations and used what I learned to architect the overall structure of our project and the frameworks we used.
 
-### Vishal: I designed the overall algorithms and approach we took. I focused on building the Spaced Retrieval (SR) agent and helped with the HUD. 
+### Vishal: 
+I designed the overall algorithms and approach we took. I focused on building the Spaced Retrieval (SR) agent and helped with the HUD. 
 
-### Samarth: I built both the Episodic Specificity Induction (ESI) and general assistant agents. Specifically, I specced out the agent workflows, ported functionality to Langgraph, and used Cerebras to speed up inference, yielding smooth conversation. I also created the base backend infrastructure for video storage and chat messages/sessions.
+### Samarth: 
+I built both the Episodic Specificity Induction (ESI) and general assistant agents. Specifically, I specced out the agent workflows, ported functionality to Langgraph, and used Cerebras to speed up inference, yielding smooth conversation. I also created the base backend infrastructure for video storage and chat messages/sessions.
 Challenges we ran into
 
 We chose to use LangGraph for its ability to automatically persist agent graph state such as conversation history to our Postgres database. However, we experienced significant issues with the library’s builtin Postgres “checkpointer” and it often failed to write into the database. We ultimately decided to write our own message database schema and code to save messages after each LLM inference and tool call result, as well as retrieve session data when chatting in existing sessions. 
