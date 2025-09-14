@@ -686,16 +686,22 @@ class SRAgentRunner:
                 _log_sr_error(state, f"Failed to prepare questions/enqueue for {cid}", e)
                 continue
 
-        # If an item is due now, start session and attach media
+        # Prepare media context for all selected clips (attach once at kickoff)
+        media_parts_all: List[MediaPart] = []
+        if selected:
+            try:
+                media_parts_all = prepare_video_context(selected)
+            except Exception as e:
+                _log_sr_error(state, "Failed to prepare media context for selected clips", e)
+        sr["media_attached_clips"] = list(selected)
+
+        # If an item is due now, start session (fast-start will come in next phase)
         first_prompt: Optional[str] = None
-        media_parts: List[MediaPart] = []
         due = get_next_due(state, now=now)
         if due is not None:
             item = pop_next_due(state, now=now)
             if item is not None:
                 first_prompt = begin_session(state, item)
-                clip_id = item.get("clip_id", "")
-                media_parts = prepare_video_context([clip_id]) if clip_id else []
 
         # Build streaming payload
         system_prompt = _build_system_prompt()
@@ -703,8 +709,7 @@ class SRAgentRunner:
         messages: List[Any]
         if first_prompt:
             human_content: List[Any] = [
-                {"type": "text", "text": f"Greet briefly and ask exactly this question: {first_prompt}"},
-                *media_parts,
+                {"type": "text", "text": f"Ask exactly this question to begin: {first_prompt}"},
             ]
         else:
             n = len(sr.get("enqueued_clips", []))
@@ -713,9 +718,15 @@ class SRAgentRunner:
             human_content = [
                 {"type": "text", "text": f"We will practice recall for {n} short clips. Greet briefly and ask if they are ready to begin."},
             ]
-        # Compose full message list: start fresh for kickoff
+        # Compose full message list: start fresh for kickoff, attach media once as context
         state["messages"] = [
             SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
+                    *media_parts_all,
+                ]
+            ),
             HumanMessage(content=human_content),
         ]
 
