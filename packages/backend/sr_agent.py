@@ -732,6 +732,11 @@ class SRAgentRunner:
         # If session active: record answer and determine next step
         sess = sr.get("active_session")
         human_content: List[Any]
+        # Always append the user's utterance to history first to preserve continuity
+        prior_messages = state.get("messages", []) or []
+        user_text = (user_message or "")
+        if user_text:
+            prior_messages = prior_messages + [HumanMessage(content=user_text)]
         if isinstance(sess, dict):
             # Evaluate user's answer with LLM against expected answer for the current question
             qs = sess.get("questions", []) or []
@@ -805,11 +810,8 @@ class SRAgentRunner:
                     msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
                 human_content = [{"type": "text", "text": msg}]
 
-        # Append to existing messages in graph state (like esi_agent.py)
-        system_prompt = _build_system_prompt()
-        prior_messages = state.get("messages", []) or []
+        # Append control instruction only; do not re-add system prompts on chat turns
         state["messages"] = prior_messages + [
-            SystemMessage(content=system_prompt),
             HumanMessage(content=human_content),
         ]
 
