@@ -12,7 +12,8 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph import START, StateGraph
-from agent_state import State
+from agent_state import State, get_state_from_supabase
+
 # from postgres import AsyncPostgresSaver  # Lazily imported in _initialize_agent to avoid libpq issues in tests
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
@@ -75,6 +76,7 @@ def prepare_video_context(clip_uuids: List[str]) -> List[MediaPart]:
 # ---------------------------------------------------------------------
 # Phase 1: AgentGraphState schema and defaults (JSON-friendly)
 # ---------------------------------------------------------------------
+
 
 class QuestionState(TypedDict):
     """Serializable cue-based question."""
@@ -173,7 +175,13 @@ def ensure_sr_slice(state: Dict[str, Any]) -> SRState:
     if not isinstance(sr.get("errors"), list):
         sr["errors"] = []
     # Initialize new stage-related fields
-    if sr.get("stage") not in {"kickoff", "session_active", "feedback_next", "waiting", "idle"}:
+    if sr.get("stage") not in {
+        "kickoff",
+        "session_active",
+        "feedback_next",
+        "waiting",
+        "idle",
+    }:
         sr["stage"] = "idle"
     if not isinstance(sr.get("last_stage_change_at"), str):
         sr["last_stage_change_at"] = _to_iso(datetime.utcnow())
@@ -231,21 +239,32 @@ def configure_sr_from_env(state: Dict[str, Any]) -> None:
     """
     sr = ensure_sr_slice(state)
 
-    intervals = _parse_int_list_env("SR_INTERVAL_SECONDS", sr.get("interval_seconds", DEFAULT_INTERVAL_SECONDS))
+    intervals = _parse_int_list_env(
+        "SR_INTERVAL_SECONDS", sr.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    )
     intervals = [x for x in intervals if isinstance(x, int) and x > 0]
     sr["interval_seconds"] = intervals or list(DEFAULT_INTERVAL_SECONDS)
 
-    sr["questions_per_clip"] = _parse_int_env("SR_QUESTIONS_PER_CLIP", sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP))
-    sr["candidate_limit"] = _parse_int_env("SR_CANDIDATE_LIMIT", sr.get("candidate_limit", DEFAULT_CANDIDATE_LIMIT))
+    sr["questions_per_clip"] = _parse_int_env(
+        "SR_QUESTIONS_PER_CLIP",
+        sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP),
+    )
+    sr["candidate_limit"] = _parse_int_env(
+        "SR_CANDIDATE_LIMIT", sr.get("candidate_limit", DEFAULT_CANDIDATE_LIMIT)
+    )
     # number of clips per SR run
     sr["max_clips"] = _parse_int_env("SR_MAX_CLIPS", int(sr.get("max_clips", 3)))
 
     # Video source configuration is read where discovery is performed; export defaults via env
     sr.setdefault("video_table", os.getenv("SR_VIDEO_TABLE", DEFAULT_VIDEO_TABLE))
-    sr.setdefault("video_ts_column", os.getenv("SR_VIDEO_TS_COLUMN", DEFAULT_VIDEO_TS_COLUMN))
+    sr.setdefault(
+        "video_ts_column", os.getenv("SR_VIDEO_TS_COLUMN", DEFAULT_VIDEO_TS_COLUMN)
+    )
 
 
-def _log_sr_error(state: Dict[str, Any], msg: str, exc: Optional[BaseException] = None) -> None:
+def _log_sr_error(
+    state: Dict[str, Any], msg: str, exc: Optional[BaseException] = None
+) -> None:
     """Print and persist a timestamped SR error message in state."""
     ts = datetime.utcnow().isoformat()
     full = f"[SR][{ts}] {msg}"
@@ -265,6 +284,7 @@ def _log_sr_error(state: Dict[str, Any], msg: str, exc: Optional[BaseException] 
 # ---------------------------------------------------------------------
 # Phase 2: Pure state helpers (discovery, selection, scheduling, sessions)
 # ---------------------------------------------------------------------
+
 
 def _to_naive_utc(dt: datetime) -> datetime:
     if getattr(dt, "tzinfo", None) is not None:
@@ -328,7 +348,11 @@ def load_recent_video_ids(state: Dict[str, Any]) -> List[str]:
 
     # Fallback ordering by created_at
     try:
-        query = supabase.table(table).select("id, created_at").order("created_at", desc=True)
+        query = (
+            supabase.table(table)
+            .select("id, created_at")
+            .order("created_at", desc=True)
+        )
         if limit:
             query = query.limit(limit)
         resp = query.execute()
@@ -389,7 +413,9 @@ def _head_due_index(q: List[QueueItemState], now_dt: datetime) -> Optional[int]:
     return best_idx
 
 
-def get_next_due(state: Dict[str, Any], now: Optional[datetime] = None) -> Optional[QueueItemState]:
+def get_next_due(
+    state: Dict[str, Any], now: Optional[datetime] = None
+) -> Optional[QueueItemState]:
     sr = ensure_sr_slice(state)
     q = sr.get("queue", []) or []
     now_dt = _to_naive_utc(now or datetime.utcnow())
@@ -397,7 +423,9 @@ def get_next_due(state: Dict[str, Any], now: Optional[datetime] = None) -> Optio
     return q[idx] if idx is not None else None
 
 
-def pop_next_due(state: Dict[str, Any], now: Optional[datetime] = None) -> Optional[QueueItemState]:
+def pop_next_due(
+    state: Dict[str, Any], now: Optional[datetime] = None
+) -> Optional[QueueItemState]:
     sr = ensure_sr_slice(state)
     q = sr.get("queue", []) or []
     now_dt = _to_naive_utc(now or datetime.utcnow())
@@ -449,13 +477,15 @@ def append_answer_and_advance(state: Dict[str, Any], answer: str) -> None:
     question_text = str(qs[q_index].get("text_cue", ""))
     expected_answer = str(qs[q_index].get("answer", ""))
     exchanges = list(sess.get("exchanges", []))
-    exchanges.append({
-        "question": question_text,
-        "user": str(answer or "").strip(),
-        "assessment": "",
-        "q_index": int(q_index),
-        "expected_answer": expected_answer,
-    })
+    exchanges.append(
+        {
+            "question": question_text,
+            "user": str(answer or "").strip(),
+            "assessment": "",
+            "q_index": int(q_index),
+            "expected_answer": expected_answer,
+        }
+    )
     sess["exchanges"] = exchanges
     sess["q_index"] = q_index + 1
     sr["active_session"] = sess
@@ -486,7 +516,8 @@ def evaluate_session(state: Dict[str, Any]) -> Dict[str, Any]:
     exchanges = list(sess.get("exchanges", []))
     total = max(1, len(qs))
     have_assessment = any(
-        isinstance(ex, dict) and ex.get("assessment") in {"correct", "incorrect"} for ex in exchanges
+        isinstance(ex, dict) and ex.get("assessment") in {"correct", "incorrect"}
+        for ex in exchanges
     )
     correct_count = 0
     if have_assessment:
@@ -514,9 +545,22 @@ def _soft_match_correct(user_answer: str, expected_answer: str) -> bool:
         return False
     # simple synonyms/variants
     synonyms = {
-        "splash": {"splash", "splashing", "splashing around", "splash around", "playing in water"},
+        "splash": {
+            "splash",
+            "splashing",
+            "splashing around",
+            "splash around",
+            "playing in water",
+        },
         "black": {"black", "dark", "dark-colored", "dark coloured"},
-        "canyon": {"canyon", "canyons", "rocky canyon", "rocky canyons", "river canyon", "rocky valley"},
+        "canyon": {
+            "canyon",
+            "canyons",
+            "rocky canyon",
+            "rocky canyons",
+            "river canyon",
+            "rocky valley",
+        },
         "valley": {"valley", "river valley", "rocky valley"},
         "two": {"two", "2", "a couple", "couple"},
     }
@@ -535,7 +579,9 @@ def _soft_match_correct(user_answer: str, expected_answer: str) -> bool:
     return False
 
 
-def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_answer: str) -> Dict[str, Any]:
+def _evaluate_answer_with_llm(
+    question_text: str, expected_answer: str, user_answer: str
+) -> Dict[str, Any]:
     """Use the chat model to judge if the user's answer is correct.
 
     Returns a dict: {"correct": bool, "feedback": str, "correct_answer": str}
@@ -545,7 +591,7 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
         "You are grading a short recall answer for spaced retrieval. Decide if the user's answer matches the expected answer. "
         "Be lenient: accept paraphrases, synonyms, plural/singular variants, close color/number descriptors, and everyday phrasing. "
         "Favor semantic equivalence over exact wording; only mark incorrect if clearly incompatible. If in doubt, mark correct. "
-        "Return ONLY JSON: {\"correct\": true|false, \"feedback\": string, \"correct_answer\": string}. Keep feedback one short sentence.\n\n"
+        'Return ONLY JSON: {"correct": true|false, "feedback": string, "correct_answer": string}. Keep feedback one short sentence.\n\n'
         "Examples (grade as correct):\n"
         "- expected: 'splashing in the river'; user: 'they were splashing around'\n"
         "- expected: 'rocky canyons'; user: 'rocky canyon'\n"
@@ -563,7 +609,9 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
             HumanMessage(content=f"Data:\n{json.dumps(payload, ensure_ascii=False)}"),
         ]
     )
-    text = resp.content if isinstance(resp.content, str) else getattr(resp, "content", "")
+    text = (
+        resp.content if isinstance(resp.content, str) else getattr(resp, "content", "")
+    )
     result = {"correct": False, "feedback": "", "correct_answer": expected_answer}
     try:
         parsed = json.loads(text)
@@ -574,8 +622,12 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
                 parsed_correct = True
                 parsed["feedback"] = parsed.get("feedback") or "Correct."
             result["correct"] = parsed_correct
-            result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if parsed_correct else "That's not quite right.")
-            result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
+            result["feedback"] = str(parsed.get("feedback", "")).strip() or (
+                "Correct." if parsed_correct else "That's not quite right."
+            )
+            result["correct_answer"] = str(
+                parsed.get("correct_answer", expected_answer)
+            )
             return result
     except Exception:
         # salvage JSON if wrapped
@@ -586,22 +638,38 @@ def _evaluate_answer_with_llm(question_text: str, expected_answer: str, user_ans
                 parsed = json.loads(text[start : end + 1])
                 if isinstance(parsed, dict):
                     parsed_correct = bool(parsed.get("correct", False))
-                    if not parsed_correct and _soft_match_correct(user_answer, expected_answer):
+                    if not parsed_correct and _soft_match_correct(
+                        user_answer, expected_answer
+                    ):
                         parsed_correct = True
                         parsed["feedback"] = parsed.get("feedback") or "Correct."
                     result["correct"] = parsed_correct
-                    result["feedback"] = str(parsed.get("feedback", "")).strip() or ("Correct." if parsed_correct else "That's not quite right.")
-                    result["correct_answer"] = str(parsed.get("correct_answer", expected_answer))
+                    result["feedback"] = str(parsed.get("feedback", "")).strip() or (
+                        "Correct." if parsed_correct else "That's not quite right."
+                    )
+                    result["correct_answer"] = str(
+                        parsed.get("correct_answer", expected_answer)
+                    )
                     return result
         except Exception:
             pass
     # fallback heuristic (soft match)
     if _soft_match_correct(user_answer, expected_answer):
-        return {"correct": True, "feedback": "Correct.", "correct_answer": expected_answer}
-    return {"correct": False, "feedback": "That's not quite right.", "correct_answer": expected_answer}
+        return {
+            "correct": True,
+            "feedback": "Correct.",
+            "correct_answer": expected_answer,
+        }
+    return {
+        "correct": False,
+        "feedback": "That's not quite right.",
+        "correct_answer": expected_answer,
+    }
 
 
-def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = None) -> None:
+def reschedule(
+    state: Dict[str, Any], success: bool, now: Optional[datetime] = None
+) -> None:
     """Reschedule the active session clip at the next/previous interval and clear session."""
     sr = ensure_sr_slice(state)
     sess = sr.get("active_session")
@@ -618,7 +686,14 @@ def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = N
     attempt = int(sess.get("attempt_count", 0)) + 1
     clip_id = str(sess.get("clip_id", ""))
     questions = list(sess.get("questions", []))
-    enqueue(state, clip_id=clip_id, questions=questions, interval_index=next_idx, base_time=now or datetime.utcnow(), attempt_count=attempt)
+    enqueue(
+        state,
+        clip_id=clip_id,
+        questions=questions,
+        interval_index=next_idx,
+        base_time=now or datetime.utcnow(),
+        attempt_count=attempt,
+    )
     sr["active_session"] = None
     # Make stage explicit for idle/waiting state
     try:
@@ -637,45 +712,37 @@ def _build_system_prompt_master() -> str:
         "ROLE\n"
         "You are a supportive Spaced Retrieval (SR) memory coach helping a person practice recall from first-person smart‑glasses clips. "
         "You run inside a stateful LangGraph agent whose state persists between turns. Your job is to strengthen recall using short, concrete questions at increasing intervals.\n\n"
-
         "END‑TO‑END FLOW (HIGH LEVEL)\n"
         "1) Kickoff: select a small subset of clips and ask once if they are ready to begin.\n"
         "2) Session: for the current clip, ask one concrete question at a time; after each answer, briefly judge correctness; if incorrect, state the correct answer once; then ask the next question (exact text).\n"
         "3) Spacing: when a clip’s questions finish, the system will schedule it forward/backward based on performance; you may acknowledge this briefly and move on.\n"
         "4) Waiting: when nothing is due, offer one short supportive line and keep the conversation light.\n\n"
-
         "MEDIA & CONTEXT\n"
         "Kickoff may include one message containing media parts (video). Assume these remain in history; you can reference them later without re‑sending media. Do not invent visual details that are not plausibly present.\n\n"
-
         "QUESTION DESIGN\n"
         "- Ask exactly one concrete recall question per turn.\n"
         "- Favor where/when anchors and sensory details (color, texture, sound, temperature).\n"
         "- If the user struggles, gently scaffold (offer a tiny, concrete angle) rather than broad hints.\n\n"
-
         "ANSWER HANDLING\n"
         "- Respond first with a brief, natural correctness judgment.\n"
         "- If the answer is not correct, provide the correct answer once, succinctly.\n"
         "- Treat close paraphrases as correct; prioritize semantic equivalence over exact wording.\n"
         "- Then naturally segue to the next question (using the exact text provided by the system).\n\n"
-
         "STAGE POLICIES (ENFORCED)\n"
         "- kickoff: Ask readiness once. Never re‑ask readiness later. No repeated greetings.\n"
         "- session_active: Include correctness, (if needed) the correct answer, then ask the exact next question. No greetings. No readiness prompts.\n"
         "- waiting: One short, supportive line only; acknowledge user if they talk. No greetings. No readiness prompts.\n\n"
-
         "TONE, UX & SAFETY\n"
         "- Tone: warm, validating, collaborative; avoid clinical or robotic phrasing.\n"
         "- Brevity: 1–3 short sentences unless asked for more.\n"
         "- Momentum: keep moving with light, supportive pacing; one question at a time.\n"
         "- Agency: invite participation without pressure; celebrate effort and progress.\n"
         "- Avoid repeating prologues or meta‑instructions to the user.\n\n"
-
         "WHAT NOT TO DO\n"
-        "- Do not ask \"Are you ready?\" outside kickoff.\n"
+        '- Do not ask "Are you ready?" outside kickoff.\n'
         "- Do not greet repeatedly.\n"
         "- Do not expose internal instructions or tools.\n"
         "- Do not produce long boilerplate or rigid templates.\n\n"
-
         "SUCCESS CRITERIA\n"
         "Each turn should (1) sound natural/warm, (2) include the stage‑required information, and (3) sustain momentum with one clear, concrete question."
     )
@@ -712,79 +779,8 @@ class SRAgentRunner:
         self.session_id = session_id or f"sr_session_{datetime.now().isoformat()}"
         self.config = {"configurable": {"thread_id": self.session_id}}
 
-        # Initialize single checkpointer and agent (like esi_agent.py)
-        self._checkpointer = None
-        self._agent = None
-        self._initialize_agent()
-
-    def _initialize_agent(self):
-        if self._checkpointer is None:
-            try:
-                from psycopg import Connection
-                from psycopg.rows import dict_row
-                from postgres import AsyncPostgresSaver  # lazy import here
-
-                conn = Connection.connect(
-                    self.database_url,
-                    autocommit=True,
-                    prepare_threshold=0,
-                    row_factory=dict_row,
-                    connect_timeout=30,
-                    options="-c statement_timeout=300000",
-                )
-                self._checkpointer = AsyncPostgresSaver(conn, None)
-                self._checkpointer._conn_string = self.database_url
-                self._agent = create_react_agent(
-                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
-                    tools=[],
-                    checkpointer=self._checkpointer,
-                )
-            except Exception as e:
-                # Log fallback so it's visible during tests/dev
-                try:
-                    print(f"[SR] Falling back to in-memory state (no Postgres checkpointer): {type(e).__name__}: {e}")
-                except Exception:
-                    pass
-                # Fallback to agent without external checkpointer; keep an in-memory state copy
-                self._memory_state: Dict[str, Any] = {}
-                self._checkpointer = None
-                self._agent = create_react_agent(
-                    model=init_chat_model(model="gemini-2.5-flash", model_provider="google_genai"),
-                    tools=[],
-                    checkpointer=None,
-                )
-
-    def __del__(self):
-        if self._checkpointer and hasattr(self._checkpointer, "conn"):
-            try:
-                self._checkpointer.conn.close()
-            except Exception:
-                pass
-
-    def _get_state(self) -> Dict[str, Any]:
-        try:
-            snapshot = self._agent.get_state(self.config)
-            state = snapshot.values
-        except Exception:
-            state = {}
-        # Merge in-memory SR slice for continuity when no checkpointer is available
-        mem_sr: Optional[Dict[str, Any]] = None
-        if hasattr(self, "_memory_state") and isinstance(getattr(self, "_memory_state", {}).get("sr"), dict):
-            mem_sr = getattr(self, "_memory_state")["sr"]  # type: ignore[index]
-        if not state and hasattr(self, "_memory_state"):
-            state = self._memory_state
-        # Prefer memory SR if available to avoid losing stage/active_session between turns
-        if isinstance(mem_sr, dict):
-            state["sr"] = mem_sr
-        elif "sr" not in state or not isinstance(state.get("sr"), dict):
-            state["sr"] = {}
-            # Seed memory with a fresh sr slice so subsequent turns persist
-            if hasattr(self, "_memory_state"):
-                self._memory_state["sr"] = state["sr"]
-        return state
-
     async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
-        state = self._get_state()
+        state = get_state_from_supabase(self.session_id)
         # Initialize config/defaults on sr slice
         configure_sr_from_env(state)
 
@@ -794,9 +790,13 @@ class SRAgentRunner:
             # Fallback: use SR_FALLBACK_CLIP_IDS if provided for offline/dev
             fb = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
             if fb:
-                candidates = _dedupe_preserve_order([cid.strip() for cid in fb.split(",") if cid.strip()])
+                candidates = _dedupe_preserve_order(
+                    [cid.strip() for cid in fb.split(",") if cid.strip()]
+                )
             if not candidates:
-                _log_sr_error(state, "No candidate clips found (Supabase and fallback empty)")
+                _log_sr_error(
+                    state, "No candidate clips found (Supabase and fallback empty)"
+                )
         sr = ensure_sr_slice(state)
         max_clips = int(sr.get("max_clips", 3))
         selected = select_first_n(candidates, n=max_clips)
@@ -812,7 +812,8 @@ class SRAgentRunner:
                 qgen = QuestionGenerator(VideoClip(cid))
                 questions_objs = qgen.generate(num_questions=qpc) or []
                 questions: List[QuestionState] = [
-                    {"text_cue": str(q.text_cue), "answer": str(q.answer)} for q in questions_objs
+                    {"text_cue": str(q.text_cue), "answer": str(q.answer)}
+                    for q in questions_objs
                 ]
                 if not questions:
                     _log_sr_error(state, f"No questions generated for clip {cid}")
@@ -822,10 +823,19 @@ class SRAgentRunner:
                 cq[cid] = questions
                 sr["clip_questions"] = cq
                 # Enqueue
-                enqueue(state, clip_id=cid, questions=questions, interval_index=0, base_time=now, attempt_count=0)
+                enqueue(
+                    state,
+                    clip_id=cid,
+                    questions=questions,
+                    interval_index=0,
+                    base_time=now,
+                    attempt_count=0,
+                )
                 sr["enqueued_clips"].append(cid)
             except Exception as e:
-                _log_sr_error(state, f"Failed to prepare questions/enqueue for {cid}", e)
+                _log_sr_error(
+                    state, f"Failed to prepare questions/enqueue for {cid}", e
+                )
                 continue
 
         # Prepare media context for all selected clips (attach once at kickoff)
@@ -834,12 +844,18 @@ class SRAgentRunner:
             try:
                 media_parts_all = prepare_video_context(selected)
             except Exception as e:
-                _log_sr_error(state, "Failed to prepare media context for selected clips", e)
+                _log_sr_error(
+                    state, "Failed to prepare media context for selected clips", e
+                )
         sr["media_attached_clips"] = list(selected)
 
         # Fast-start vs readiness-gated kickoff (default: readiness-gated)
         first_prompt: Optional[str] = None
-        fast_start_env = (os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"})
+        fast_start_env = os.getenv("SR_FAST_START", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         if fast_start_env:
             try:
                 q = sr.get("queue", []) or []
@@ -858,7 +874,11 @@ class SRAgentRunner:
                 else:
                     set_stage(state, "kickoff")
             except Exception as e:
-                _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
+                _log_sr_error(
+                    state,
+                    "Fast-start selection failed; falling back to readiness prompt",
+                    e,
+                )
                 set_stage(state, "kickoff")
         else:
             # Deterministic kickoff text; wait for user readiness in chat()
@@ -870,14 +890,20 @@ class SRAgentRunner:
         messages: List[Any]
         if first_prompt:
             human_content: List[Any] = [
-                {"type": "text", "text": f"Ask exactly this question to begin: {first_prompt}"},
+                {
+                    "type": "text",
+                    "text": f"Ask exactly this question to begin: {first_prompt}",
+                },
             ]
         else:
             n = len(sr.get("enqueued_clips", []))
             if n == 0:
                 _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
             human_content = [
-                {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
+                {
+                    "type": "text",
+                    "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?",
+                },
             ]
         # Compose full message list: start fresh for kickoff, attach media once as context
         stage_prompt = _build_system_prompt_kickoff()
@@ -886,7 +912,10 @@ class SRAgentRunner:
             SystemMessage(content=stage_prompt),
             HumanMessage(
                 content=[
-                    {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
+                    {
+                        "type": "text",
+                        "text": "Context: media for all selected clips (reference these clips during this SR session).",
+                    },
                     *media_parts_all,
                 ]
             ),
@@ -901,12 +930,12 @@ class SRAgentRunner:
                 pass
 
         async for part in parse_langgraph_stream(
-            self._agent.astream(state, config=self.config, stream_mode="messages")
+            sr_graph.astream(state, config=self.config, stream_mode="messages")
         ):
             yield part
 
     async def chat(self, user_message: str) -> AsyncGenerator[StreamProtocolPart, None]:
-        state = self._get_state()
+        state = get_state_from_supabase(self.session_id)
         sr = ensure_sr_slice(state)
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
@@ -915,13 +944,15 @@ class SRAgentRunner:
         human_content: List[Any]
         # Always append the user's utterance to history first to preserve continuity
         prior_messages = state.get("messages", []) or []
-        user_text = (user_message or "")
+        user_text = user_message or ""
         if user_text:
             prior_messages = prior_messages + [HumanMessage(content=user_text)]
         if isinstance(sess, dict):
             # On transition into session_active, append stage system prompt once
             if set_stage(state, "session_active"):
-                prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
+                prior_messages.append(
+                    SystemMessage(content=_build_system_prompt_session())
+                )
             # Evaluate user's answer with LLM against expected answer for the current question
             qs = sess.get("questions", []) or []
             q_index = int(sess.get("q_index", 0))
@@ -932,7 +963,9 @@ class SRAgentRunner:
             if 0 <= q_index < len(qs):
                 expected_answer = str(qs[q_index].get("answer", ""))
                 question_text = str(qs[q_index].get("text_cue", ""))
-            eval_res = _evaluate_answer_with_llm(question_text, expected_answer, user_message)
+            eval_res = _evaluate_answer_with_llm(
+                question_text, expected_answer, user_message
+            )
 
             # Record exchange with index/expected answer and advance
             append_answer_and_advance(state, user_message)
@@ -943,7 +976,9 @@ class SRAgentRunner:
                 target_idx = sr.get("pending_eval_q_index")
                 for ex in reversed(exchanges):
                     if isinstance(ex, dict) and ex.get("q_index") == target_idx:
-                        ex["assessment"] = "correct" if eval_res.get("correct") else "incorrect"
+                        ex["assessment"] = (
+                            "correct" if eval_res.get("correct") else "incorrect"
+                        )
                         break
                 sess2["exchanges"] = exchanges
                 ensure_sr_slice(state)["active_session"] = sess2
@@ -959,16 +994,31 @@ class SRAgentRunner:
                     feedback_lines.append(f"Correct answer: {ca}")
 
             if not session_finished(state):
-                prompt = current_prompt(state) or "Notice one concrete detail you remember from this clip."
+                prompt = (
+                    current_prompt(state)
+                    or "Notice one concrete detail you remember from this clip."
+                )
                 clip_id = str(sess.get("clip_id", ""))
                 # Do not reattach media; it was attached once at kickoff
                 human_content = [
-                    {"type": "text", "text": " ".join(feedback_lines) + f"\nNext question (ask exactly as written): {prompt}"},
+                    {
+                        "type": "text",
+                        "text": " ".join(feedback_lines)
+                        + f"\nNext question (ask exactly as written): {prompt}",
+                    },
                 ]
             else:
                 result = evaluate_session(state)
-                reschedule(state, success=bool(result.get("success", False)), now=datetime.utcnow())
-                summary = "Session complete. " + ("Strong recall." if result.get("success") else "We will revisit soon to reinforce.")
+                reschedule(
+                    state,
+                    success=bool(result.get("success", False)),
+                    now=datetime.utcnow(),
+                )
+                summary = "Session complete. " + (
+                    "Strong recall."
+                    if result.get("success")
+                    else "We will revisit soon to reinforce."
+                )
                 human_content = [
                     {"type": "text", "text": summary},
                 ]
@@ -978,8 +1028,16 @@ class SRAgentRunner:
             user_text_norm = (user_message or "").strip().lower()
             if get_stage(state) == "kickoff":
                 # Gate on readiness (treat any substantive response as readiness too)
-                substantive = len(user_text.strip()) >= 2 and user_text_norm not in {"no", "not yet", "later"}
-                if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"} or substantive:
+                substantive = len(user_text.strip()) >= 2 and user_text_norm not in {
+                    "no",
+                    "not yet",
+                    "later",
+                }
+                if (
+                    user_text_norm
+                    in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"}
+                    or substantive
+                ):
                     # Start earliest item now
                     q = sr.get("queue", []) or []
                     if q:
@@ -987,12 +1045,29 @@ class SRAgentRunner:
                         sr["queue"] = q
                         prompt = begin_session(state, item)
                         if set_stage(state, "session_active"):
-                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
-                        human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
+                            prior_messages.append(
+                                SystemMessage(content=_build_system_prompt_session())
+                            )
+                        human_content = [
+                            {
+                                "type": "text",
+                                "text": f"Ask exactly this to begin: {prompt}",
+                            }
+                        ]
                     else:
-                        human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
+                        human_content = [
+                            {
+                                "type": "text",
+                                "text": "We don't have a clip ready yet. Give me a moment.",
+                            }
+                        ]
                 else:
-                    human_content = [{"type": "text", "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'."}]
+                    human_content = [
+                        {
+                            "type": "text",
+                            "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'.",
+                        }
+                    ]
             else:
                 # Non-kickoff idle path: due check or small talk
                 due = get_next_due(state, now=now)
@@ -1001,13 +1076,27 @@ class SRAgentRunner:
                     if item is not None:
                         prompt = begin_session(state, item)
                         if set_stage(state, "session_active"):
-                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
-                        human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
+                            prior_messages.append(
+                                SystemMessage(content=_build_system_prompt_session())
+                            )
+                        human_content = [
+                            {
+                                "type": "text",
+                                "text": f"Ask exactly this to begin the next session: {prompt}",
+                            }
+                        ]
                     else:
-                        human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
+                        human_content = [
+                            {
+                                "type": "text",
+                                "text": "Acknowledge and offer a brief supportive remark while waiting.",
+                            }
+                        ]
                 else:
                     if set_stage(state, "waiting"):
-                        prior_messages.append(SystemMessage(content=_build_system_prompt_waiting()))
+                        prior_messages.append(
+                            SystemMessage(content=_build_system_prompt_waiting())
+                        )
                     if user_text_norm in {"begin", "start", "next", "go", "ready"}:
                         msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
                     else:
@@ -1027,7 +1116,7 @@ class SRAgentRunner:
                 pass
 
         async for part in parse_langgraph_stream(
-            self._agent.astream(state, config=self.config, stream_mode="messages")
+            sr_graph.astream(state, config=self.config, stream_mode="messages")
         ):
             yield part
 
@@ -1035,6 +1124,7 @@ class SRAgentRunner:
 # ---------------------------------------------------------------------
 # LangGraph nodes and compiled graph (mirroring esi_agent.py structure)
 # ---------------------------------------------------------------------
+
 
 def sr_agent_node(state: State) -> State:
     """Invoke the SR assistant model on the provided message list.
@@ -1069,13 +1159,16 @@ sr_graph_builder.add_edge(START, "agent")
 # No tools/conditional edges yet for SR
 sr_graph = sr_graph_builder.compile()
 
+
 async def main():
     """CLI for SR Agent runner (kickoff/chat/interactive)."""
     import argparse
 
     parser = argparse.ArgumentParser(description="SR Agent (kickoff once, then chat)")
     parser.add_argument("--session-id", help="Session ID for conversation persistence")
-    parser.add_argument("--chat", help="Send a single chat message (assumes kickoff already run)")
+    parser.add_argument(
+        "--chat", help="Send a single chat message (assumes kickoff already run)"
+    )
     parser.add_argument(
         "--interactive",
         action="store_true",
@@ -1102,8 +1195,17 @@ async def main():
             print("Coach:", part)
     elif args.interactive:
         print("Starting SR session...")
-        print("- Kickoff will "+("start immediately with the first question." if fast else "ask if you're ready first."))
-        print("- Type your responses. To start after readiness prompt, type 'ready'. Ctrl+C to quit.")
+        print(
+            "- Kickoff will "
+            + (
+                "start immediately with the first question."
+                if fast
+                else "ask if you're ready first."
+            )
+        )
+        print(
+            "- Type your responses. To start after readiness prompt, type 'ready'. Ctrl+C to quit."
+        )
         try:
             async for part in runner.kickoff():
                 print("Coach:", part)
@@ -1119,5 +1221,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
