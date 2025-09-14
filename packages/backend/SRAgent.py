@@ -537,8 +537,89 @@ class SRAgent:
             surrounding API layer may convert this into a streaming response and
             tool-calls when implementing the final product.
         """
-        # No implementation yet
-        pass
+        # Update last activity timestamp
+        self._last_activity_at = datetime.utcnow()
+
+        # 1) If there is an active session, continue it
+        if self._active_session:
+            clip_id = str(self._active_session.get("clip_id", ""))
+            q_index = int(self._active_session.get("q_index", 0))
+            questions_state = self._active_session.get("questions", []) or []
+
+            # Convert questions_state back into displayable prompts for consistency
+            questions: List[Question] = [
+                Question(video_clip=None, text_cue=str(q.get("text_cue", "")), answer=str(q.get("answer", "")))
+                for q in questions_state
+            ]
+
+            # Append the user's response to the current exchange
+            if q_index < len(questions):
+                current_q = questions[q_index]
+                exchanges = list(self._active_session.get("exchanges", []))
+                exchanges.append({
+                    "question": current_q.text_cue,
+                    "user": user_text,
+                    "assessment": "",  # Placeholder; future semantic evaluation can fill this
+                })
+                self._active_session["exchanges"] = exchanges
+                # Advance to the next question
+                self._active_session["q_index"] = q_index + 1
+
+                # If there are more questions, return the next prompt
+                if (q_index + 1) < len(questions):
+                    next_q = questions[q_index + 1]
+                    prompt = next_q.text_cue.strip() or "Notice one concrete detail you remember from this clip."
+                    # Project state (LangGraph will persist)
+                    try:
+                        self.save_sr_state()
+                    except Exception:
+                        pass
+                    return f"Thanks. Next one: {prompt}"
+
+            # Otherwise, we have reached the end of questions → evaluate and reschedule
+            result = self.ask_questions_interactively(questions)
+            success = self.evaluate_performance(result)
+            # Fetch interval_index remembered in active session or default to 0
+            current_interval_index = int(self._active_session.get("interval_index", 0))
+            self.schedule_next_review(
+                clip_id=clip_id,
+                current_interval_index=current_interval_index,
+                success=success,
+                questions=questions,
+                now=self._last_activity_at,
+            )
+            # Clear active session now that we've concluded this clip's Q&A
+            self._active_session = None
+            try:
+                self.save_sr_state()
+            except Exception:
+                pass
+            return (
+                "Nice job. We'll circle back to this clip a bit later based on how it went. "
+                "Tell me when you're ready to continue."
+            )
+
+        # 2) No active session: check if any item is due
+        due_item = self.get_next_due_item()
+        if due_item is not None:
+            # Pop and begin the session
+            popped = self.pop_next_due_item()
+            if popped is not None:
+                # Start this clip's session and return first prompt
+                intro = self.conduct_clip_session(popped)
+                try:
+                    self.save_sr_state()
+                except Exception:
+                    pass
+                return intro
+
+        # 3) Otherwise, idle small talk
+        message = self.small_talk_turn()
+        try:
+            self.save_sr_state()
+        except Exception:
+            pass
+        return message
 
     # ---------------------------------------------------------------------
     # Clip selection and question preparation
@@ -754,6 +835,12 @@ class SRAgent:
                 "clip_id": item.clip_id,
                 "q_index": 0,
                 "exchanges": [],
+                # Store interval_index so we can reschedule after session
+                "interval_index": int(getattr(item, "interval_index", 0)),
+                # Cache questions on the session for stability within the run
+                "questions": [
+                    {"text_cue": q.text_cue, "answer": q.answer} for q in item.questions
+                ],
             }
 
         # Best-effort HUD display hook (upper layers may intercept)
@@ -927,8 +1014,10 @@ class SRAgent:
             A short assistant message string suitable for direct display or
             streaming by higher layers.
         """
-        # No implementation yet
-        pass
+        return (
+            "We're giving your mind a short breather. When you're ready, say 'next' and "
+            "we'll continue with another quick memory check."
+        )
 
     # ---------------------------------------------------------------------
     # Persistence helpers (Supabase-backed session and SR state)
