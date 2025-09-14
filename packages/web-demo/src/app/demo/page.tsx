@@ -8,63 +8,137 @@ import {
     SelectTrigger,
     SelectValue,
 } from "@/components/ui/select";
+import { produce } from 'immer'
 
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
 import { cn } from '@/lib/utils';
 
 export default function DemoPage() {
-    const sse = useRef<EventSource | undefined>(undefined)
-    const [messages, setMesages] = useState<UIMessage[]>([])
+    const [messages, setMessages] = useState<UIMessage[]>([])
+    const streamRef = useRef<ReadableStream<UIMessageChunk> | null>(null)
+    const sseRef = useRef<EventSource | null>(null)
+    const isCleaningUpRef = useRef(false)
+    const [transcription, setTranscription] = useState('')
+    const [transcriptionIsFinal, setTranscriptionIsFinal] = useState(false)
 
     useEffect(() => {
-        sse.current = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
-        if (!sse.current) return
-        (async () => {
+        console.log('loading sse')
+        const sse = new EventSource(process.env.NEXT_PUBLIC_BACKEND_URL! + "/web_stream");
+        sseRef.current = sse;
+
+        sse.onopen = () => {
+            console.log('SSE connection opened');
+
+            // Create the ReadableStream and store reference to prevent garbage collection
             const stream = new ReadableStream<UIMessageChunk>({
                 start(controller) {
-                    sse.current.onmessage = (event) => {
-                        controller.enqueue(event.data);
+                    sse.onmessage = (event) => {
+                        console.log('SSE message received:', event)
+                        try {
+                            // Parse the event data and enqueue it
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'data-transcription') {
+                                setTranscription(data.data.text)
+                                setTranscriptionIsFinal(data.data.isFinal)
+                                console.log('transcription: ', data.data.text)
+                            }
+                            controller.enqueue(data);
+                        } catch (error) {
+                            console.error('Error parsing SSE data:', error);
+                        }
                     };
 
-                    sse.current.onerror = (error) => {
+                    sse.onerror = (error) => {
+                        console.error('SSE error:', error);
                         controller.error(error);
-                    };
-
-                    sse.current.onopen = () => {
-                        console.log('SSE connection opened');
                     };
                 },
                 cancel() {
-                    sse.current.close();
-                }
+                    console.log('ReadableStream cancelled')
+                    // Only close SSE if we're actually cleaning up, not if stream is just being cancelled
+                    if (isCleaningUpRef.current && sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
+                        sseRef.current.close();
+                    }
+                },
             });
-            for await (const uiMessage of readUIMessageStream({
-                stream
-            })) {
-                console.log(uiMessage)
+
+            streamRef.current = stream;
+
+            // Process the stream in a separate async function
+            processUIMessageStream(stream);
+        };
+
+        sse.onerror = (error) => {
+            console.error('SSE connection error:', error);
+        };
+
+        const processUIMessageStream = async (stream: ReadableStream<UIMessageChunk>) => {
+            try {
+                for await (const uiMessage of readUIMessageStream({ stream })) {
+                    setMessages(produce(prev => {
+                        // Avoid duplicates by checking if message already exists
+                        const index = prev.findIndex(m => m.id === uiMessage.id);
+                        if (index == -1) {
+                            // @ts-expect-error deep
+                            prev.push(uiMessage)
+                        } else {
+                            prev[index] = uiMessage
+                        }
+                        return prev
+                    }));
+                }
+            } catch (error) {
+                console.error('Error processing UI message stream:', error);
+                // Don't close the stream on error, just log it
             }
-        })();
+        };
+
+        return () => {
+            console.log('Cleaning up SSE connection')
+            isCleaningUpRef.current = true;
+            if (sseRef.current && sseRef.current.readyState !== EventSource.CLOSED) {
+                sseRef.current.close();
+            }
+            sseRef.current = null;
+            streamRef.current = null;
+        }
     }, [])
     return (
         <div className="absolute inset-0">
             <WebcamBackground />
-            <ol>
-                {messages.map((msg) => {
-                    return (
-                        <li key={msg.id} className={cn({ "bg-primary text-primary-foreground": msg.role === "user" })}>
-                            {msg.parts.map((part) => {
-                                switch (part.type) {
-                                    case "text":
-                                        return <p>{part.text}</p>
-                                    default:
-                                        return <div>{JSON.stringify(part)}</div>
-                                }
-                            })}
-                        </li>
-                    )
-                })}
-            </ol>
+            <div className="absolute inset-0 p-4">
+                <ol className="max-h-full overflow-y-auto">
+                    {messages.map((msg, msgIndex) => {
+                        if (!msg.parts.some(p => !p.type.startsWith('data-'))) return null
+                        return (
+                            <li
+                                key={msg.id || `msg-${msgIndex}`}
+                                className={cn(
+                                    "p-3 rounded-lg backdrop-blur-sm",
+                                    {
+                                        "bg-blue-500/80 text-white ml-8": msg.role === "user",
+                                        "bg-white/80 text-black mr-8": msg.role === "assistant"
+                                    }
+                                )}
+                            >
+                                {msg.parts.map((part, partIndex) => {
+                                    switch (part.type) {
+                                        case "text":
+                                            return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        default:
+                                            if (part.type.startsWith('data-')) return null
+                                            return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
+                                    }
+                                })}
+                            </li>
+                        )
+                    })}
+                    <li className={cn("text-foreground", { "opacity-70": !transcriptionIsFinal })}>
+                        {transcription}
+                    </li>
+                </ol>
+            </div>
         </div>
     )
 }
