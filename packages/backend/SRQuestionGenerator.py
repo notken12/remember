@@ -28,14 +28,16 @@ class QuestionGenerator:
     fields `text_cue` and `answer`.
     """
 
-    def __init__(self, video_clip: VideoClip, model_name: str = "gemini-2.5-flash-lite"):
+    def __init__(
+        self, video_clip: VideoClip, model_name: str = "gemini-2.5-flash-lite"
+    ):
         self.video_clip = video_clip
         self.model_name = model_name
         self.questions: List[Question] = []
 
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        gemini_api_key = os.getenv("GOOGLE_API_KEY")
         if not gemini_api_key:
-            raise ValueError("GEMINI_API_KEY environment variable is required")
+            raise ValueError("GOOGLE_API_KEY environment variable is required")
 
     def _make_media_part(self, video_bytes: bytes) -> dict:
         """
@@ -101,7 +103,10 @@ Respond with STRICT JSON only, no Markdown, no commentary. Use this schema:
                 # Last resort: extract array and wrap
                 arr_match = re.search(r"\[[\s\S]*\]", cleaned)
                 if arr_match:
-                    return {"video_id": self.video_clip.id, "questions": json.loads(arr_match.group(0))}
+                    return {
+                        "video_id": self.video_clip.id,
+                        "questions": json.loads(arr_match.group(0)),
+                    }
                 raise
 
     def generate(self, num_questions: int = 6) -> List[Question]:
@@ -120,14 +125,16 @@ Respond with STRICT JSON only, no Markdown, no commentary. Use this schema:
 
             llm = ChatGoogleGenerativeAI(
                 model=self.model_name,
-                google_api_key=os.getenv("GEMINI_API_KEY", ""),
+                google_api_key=os.getenv("GOOGLE_API_KEY", ""),
             )
             content = [media_part, {"type": "text", "text": prompt}]
             ai = llm.invoke([HumanMessage(content=content)])
             payload = self._extract_json(getattr(ai, "content", ""))
 
             # Support either a dict {{video_id, questions:[...]}} or a bare array
-            items = payload.get("questions", payload if isinstance(payload, list) else [])
+            items = payload.get(
+                "questions", payload if isinstance(payload, list) else []
+            )
 
             self.questions = [
                 Question(
@@ -182,5 +189,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
