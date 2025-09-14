@@ -263,6 +263,49 @@ def _log_sr_error(state: Dict[str, Any], msg: str, exc: Optional[BaseException] 
     sr["errors"] = errs[-50:]
 
 
+def _extract_latest_sr_state_from_messages(messages: List[Any]) -> Optional[SRState]:
+    """Scan messages from newest to oldest for a SystemMessage named 'sr_state' and parse JSON content."""
+    for m in reversed(messages or []):
+        try:
+            if m.__class__.__name__ == "SystemMessage" and getattr(m, "name", None) == "sr_state":
+                raw = getattr(m, "content", "")
+                data = json.loads(raw) if isinstance(raw, str) else None
+                if isinstance(data, dict):
+                    # Coerce to SRState shape
+                    sr_state: SRState = data  # type: ignore[assignment]
+                    return sr_state
+        except Exception:
+            continue
+    return None
+
+
+def _persist_chat_message(session_id: str, role: str, message_obj: Any) -> None:
+    try:
+        supabase.table("chat_messages").insert(
+            {
+                "role": role,
+                "data": message_obj.__dict__,
+                "session_id": str(session_id),
+            }
+        ).execute()
+    except Exception:
+        pass
+
+
+def _append_and_persist_sr_state(session_id: str, state: Dict[str, Any]) -> None:
+    sr = ensure_sr_slice(state)
+    try:
+        payload = json.dumps(sr)
+    except Exception:
+        payload = json.dumps({})
+    sr_msg = SystemMessage(content=payload, name="sr_state")
+    # Append into current messages and persist to supabase
+    msgs = state.get("messages", []) or []
+    msgs.append(sr_msg)
+    state["messages"] = msgs
+    _persist_chat_message(session_id, "system", sr_msg)
+
+
 # ---------------------------------------------------------------------
 # Phase 2: Pure state helpers (discovery, selection, scheduling, sessions)
 # ---------------------------------------------------------------------
@@ -742,120 +785,111 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
     ChatSession(session_id=str(session_id)).save_to_supabase()
     # Build initial state container
     state: Dict[str, Any] = {"messages": [], "session_id": str(session_id)}
-        # Initialize config/defaults on sr slice
+    # Initialize config/defaults on sr slice
     configure_sr_from_env(state)
 
-        # Discover and select
-        candidates = load_recent_video_ids(state)
+    # Discover and select
+    candidates = load_recent_video_ids(state)
+    if not candidates:
+        fb = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
+        if fb:
+            candidates = _dedupe_preserve_order([cid.strip() for cid in fb.split(",") if cid.strip()])
         if not candidates:
-            # Fallback: use SR_FALLBACK_CLIP_IDS if provided for offline/dev
-            fb = (os.getenv("SR_FALLBACK_CLIP_IDS") or "").strip()
-            if fb:
-                candidates = _dedupe_preserve_order([cid.strip() for cid in fb.split(",") if cid.strip()])
-            if not candidates:
-                _log_sr_error(state, "No candidate clips found (Supabase and fallback empty)")
-        sr = ensure_sr_slice(state)
-        max_clips = int(sr.get("max_clips", 3))
-        selected = select_first_n(candidates, n=max_clips)
-        sr["selected_clips"] = list(selected)
-        sr["enqueued_clips"] = []
+            _log_sr_error(state, "No candidate clips found (Supabase and fallback empty)")
+    sr = ensure_sr_slice(state)
+    max_clips = int(sr.get("max_clips", 3))
+    selected = select_first_n(candidates, n=max_clips)
+    sr["selected_clips"] = list(selected)
+    sr["enqueued_clips"] = []
 
-        # Prepare questions and enqueue
-        qpc = int(sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP))
-        now = datetime.utcnow()
-        for cid in selected:
-            try:
-                # Generate questions
-                qgen = QuestionGenerator(VideoClip(cid))
-                questions_objs = qgen.generate(num_questions=qpc) or []
-                questions: List[QuestionState] = [
-                    {"text_cue": str(q.text_cue), "answer": str(q.answer)} for q in questions_objs
-                ]
-                if not questions:
-                    _log_sr_error(state, f"No questions generated for clip {cid}")
-                    continue
-                # Cache
-                cq = sr.get("clip_questions", {}) or {}
-                cq[cid] = questions
-                sr["clip_questions"] = cq
-                # Enqueue
-                enqueue(state, clip_id=cid, questions=questions, interval_index=0, base_time=now, attempt_count=0)
-                sr["enqueued_clips"].append(cid)
-            except Exception as e:
-                _log_sr_error(state, f"Failed to prepare questions/enqueue for {cid}", e)
+    # Prepare questions and enqueue
+    qpc = int(sr.get("questions_per_clip", DEFAULT_QUESTIONS_PER_CLIP))
+    now = datetime.utcnow()
+    for cid in selected:
+        try:
+            qgen = QuestionGenerator(VideoClip(cid))
+            questions_objs = qgen.generate(num_questions=qpc) or []
+            questions: List[QuestionState] = [
+                {"text_cue": str(q.text_cue), "answer": str(q.answer)} for q in questions_objs
+            ]
+            if not questions:
+                _log_sr_error(state, f"No questions generated for clip {cid}")
                 continue
+            cq = sr.get("clip_questions", {}) or {}
+            cq[cid] = questions
+            sr["clip_questions"] = cq
+            enqueue(state, clip_id=cid, questions=questions, interval_index=0, base_time=now, attempt_count=0)
+            sr["enqueued_clips"].append(cid)
+        except Exception as e:
+            _log_sr_error(state, f"Failed to prepare questions/enqueue for {cid}", e)
+            continue
 
-        # Prepare media context for all selected clips (attach once at kickoff)
-        media_parts_all: List[MediaPart] = []
-        if selected:
-            try:
-                media_parts_all = prepare_video_context(selected)
-            except Exception as e:
-                _log_sr_error(state, "Failed to prepare media context for selected clips", e)
-        sr["media_attached_clips"] = list(selected)
+    # Prepare media context for all selected clips (attach once at kickoff)
+    media_parts_all: List[MediaPart] = []
+    if selected:
+        try:
+            media_parts_all = prepare_video_context(selected)
+        except Exception as e:
+            _log_sr_error(state, "Failed to prepare media context for selected clips", e)
+    sr["media_attached_clips"] = list(selected)
 
-        # Fast-start vs readiness-gated kickoff (default: readiness-gated)
-        first_prompt: Optional[str] = None
-        fast_start_env = (os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"})
-        if fast_start_env:
-            try:
-                q = sr.get("queue", []) or []
-                earliest_idx: Optional[int] = None
-                earliest_time: Optional[datetime] = None
-                for idx, it in enumerate(q):
-                    dt = _parse_iso(it.get("next_at", "")) or now
-                    if earliest_time is None or dt < earliest_time:
-                        earliest_time = dt
-                        earliest_idx = idx
-                if earliest_idx is not None:
-                    item = q.pop(earliest_idx)
-                    sr["queue"] = q
-                    first_prompt = begin_session(state, item)
-                    set_stage(state, "session_active")
-                else:
-                    set_stage(state, "kickoff")
-            except Exception as e:
-                _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
+    # Fast-start vs readiness-gated kickoff (default: readiness-gated)
+    first_prompt: Optional[str] = None
+    fast_start_env = (os.getenv("SR_FAST_START", "0").strip().lower() in {"1", "true", "yes"})
+    if fast_start_env:
+        try:
+            q = sr.get("queue", []) or []
+            earliest_idx: Optional[int] = None
+            earliest_time: Optional[datetime] = None
+            for idx, it in enumerate(q):
+                dt = _parse_iso(it.get("next_at", "")) or now
+                if earliest_time is None or dt < earliest_time:
+                    earliest_time = dt
+                    earliest_idx = idx
+            if earliest_idx is not None:
+                item = q.pop(earliest_idx)
+                sr["queue"] = q
+                first_prompt = begin_session(state, item)
+                set_stage(state, "session_active")
+            else:
                 set_stage(state, "kickoff")
-        else:
-            # Deterministic kickoff text; wait for user readiness in chat()
+        except Exception as e:
+            _log_sr_error(state, "Fast-start selection failed; falling back to readiness prompt", e)
             set_stage(state, "kickoff")
+    else:
+        set_stage(state, "kickoff")
 
-        # Build streaming payload
-        master_prompt = _build_system_prompt_master()
-        # Build messages list into state so checkpointer persists both messages and sr slice
-        messages: List[Any]
-        if first_prompt:
-            human_content: List[Any] = [
-                {"type": "text", "text": f"Ask exactly this question to begin: {first_prompt}"},
-            ]
-        else:
-            n = len(sr.get("enqueued_clips", []))
-            if n == 0:
-                _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
-            human_content = [
-                {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
-            ]
-        # Compose full message list: start fresh for kickoff, attach media once as context
-        stage_prompt = _build_system_prompt_kickoff()
-        state["messages"] = [
-            SystemMessage(content=master_prompt),
-            SystemMessage(content=stage_prompt),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
-                    *media_parts_all,
-                ]
-            ),
-            HumanMessage(content=human_content),
+    # Build streaming payload
+    master_prompt = _build_system_prompt_master()
+    if first_prompt:
+        human_content: List[Any] = [
+            {"type": "text", "text": f"Ask exactly this question to begin: {first_prompt}"},
         ]
-
-        # Persist SR slice in memory for continuity when no external checkpointer is present
-        if hasattr(self, "_memory_state"):
-            try:
-                self._memory_state["sr"] = ensure_sr_slice(state)
-            except Exception:
-                pass
+    else:
+        n = len(sr.get("enqueued_clips", []))
+        if n == 0:
+            _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
+        human_content = [
+            {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
+        ]
+    stage_prompt = _build_system_prompt_kickoff()
+    state["messages"] = [
+        SystemMessage(content=master_prompt),
+        SystemMessage(content=stage_prompt),
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
+                *media_parts_all,
+            ]
+        ),
+        HumanMessage(content=human_content),
+    ]
+    # Persist kickoff messages to Supabase
+    for m in state["messages"]:
+        role = "system" if isinstance(m, SystemMessage) else "user"
+        _persist_chat_message(session_id, role, m)
+    # Persist SR slice message
+    _append_and_persist_sr_state(session_id, state)
 
     # Stream with graph
     async for part in parse_langgraph_stream(
@@ -867,9 +901,12 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
     graph = _build_graph()
     # Load existing message history from Supabase
     state: State = get_state_from_supabase(session_id)
-    # State is a dict-like with messages; we will mutate and stream
+    # Restore SR slice from latest persisted sr_state system message
+    latest_sr = _extract_latest_sr_state_from_messages(state.get("messages", []))  # type: ignore[index]
+    if latest_sr:
+        state["sr"] = latest_sr
     sr = ensure_sr_slice(state)  # type: ignore[arg-type]
-        sr["last_activity_at"] = _to_iso(datetime.utcnow())
+    sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
         # If session active: record answer and determine next step
         sess = sr.get("active_session")
@@ -878,11 +915,15 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
         prior_messages = state.get("messages", []) or []  # type: ignore[index]
         user_text = (user_message or "")
         if user_text:
-            prior_messages = prior_messages + [HumanMessage(content=user_text)]
+            um = HumanMessage(content=user_text)
+            prior_messages = prior_messages + [um]
+            _persist_chat_message(session_id, "user", um)
         if isinstance(sess, dict):
             # On transition into session_active, append stage system prompt once
             if set_stage(state, "session_active"):
-                prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
+                sp = SystemMessage(content=_build_system_prompt_session())
+                prior_messages.append(sp)
+                _persist_chat_message(session_id, "system", sp)
             # Evaluate user's answer with LLM against expected answer for the current question
             qs = sess.get("questions", []) or []
             q_index = int(sess.get("q_index", 0))
@@ -948,7 +989,9 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                         sr["queue"] = q
                         prompt = begin_session(state, item)
                         if set_stage(state, "session_active"):
-                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
+                            sp2 = SystemMessage(content=_build_system_prompt_session())
+                            prior_messages.append(sp2)
+                            _persist_chat_message(session_id, "system", sp2)
                         human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
                     else:
                         human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
@@ -968,7 +1011,9 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                         human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
                 else:
                     if set_stage(state, "waiting"):
-                        prior_messages.append(SystemMessage(content=_build_system_prompt_waiting()))
+                        spw = SystemMessage(content=_build_system_prompt_waiting())
+                        prior_messages.append(spw)
+                        _persist_chat_message(session_id, "system", spw)
                     if user_text_norm in {"begin", "start", "next", "go", "ready"}:
                         msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
                     else:
@@ -976,16 +1021,11 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                     human_content = [{"type": "text", "text": msg}]
 
         # Append control instruction only; do not re-add system prompts on chat turns
-        state["messages"] = prior_messages + [  # type: ignore[index]
-            HumanMessage(content=human_content),
-        ]
-
-        # Persist SR slice in memory for continuity when no external checkpointer is present
-        if hasattr(self, "_memory_state"):
-            try:
-                self._memory_state["sr"] = ensure_sr_slice(state)
-            except Exception:
-                pass
+        next_hm = HumanMessage(content=human_content)
+        state["messages"] = prior_messages + [next_hm]  # type: ignore[index]
+        _persist_chat_message(session_id, "user", next_hm)
+        # Persist updated SR slice for this turn
+        _append_and_persist_sr_state(session_id, state)
 
     async for part in parse_langgraph_stream(
         graph.astream(state, stream_mode="messages")
