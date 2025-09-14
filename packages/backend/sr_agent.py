@@ -907,17 +907,17 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
     sr = ensure_sr_slice(state)  # type: ignore[arg-type]
     sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
-        # If session active: record answer and determine next step
-        sess = sr.get("active_session")
-        human_content: List[Any]
-        # Always append the user's utterance to history first to preserve continuity
-        prior_messages = state.get("messages", []) or []  # type: ignore[index]
-        user_text = (user_message or "")
-        if user_text:
-            um = HumanMessage(content=user_text)
-            prior_messages = prior_messages + [um]
-            _persist_chat_message(session_id, "user", um)
-        if isinstance(sess, dict):
+    # If session active: record answer and determine next step
+    sess = sr.get("active_session")
+    human_content: List[Any]
+    # Always append the user's utterance to history first to preserve continuity
+    prior_messages = state.get("messages", []) or []  # type: ignore[index]
+    user_text = (user_message or "")
+    if user_text:
+        um = HumanMessage(content=user_text)
+        prior_messages = prior_messages + [um]
+        _persist_chat_message(session_id, "user", um)
+    if isinstance(sess, dict):
             # On transition into session_active, append stage system prompt once
             if set_stage(state, "session_active"):
                 sp = SystemMessage(content=_build_system_prompt_session())
@@ -973,51 +973,51 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                 human_content = [
                     {"type": "text", "text": summary},
                 ]
-        else:
-            # No active session
-            now = datetime.utcnow()
-            user_text_norm = (user_message or "").strip().lower()
-            if get_stage(state) == "kickoff":
-                # Gate on readiness (treat any substantive response as readiness too)
-                substantive = len(user_text.strip()) >= 2 and user_text_norm not in {"no", "not yet", "later"}
-                if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"} or substantive:
-                    # Start earliest item now
-                    q = sr.get("queue", []) or []
-                    if q:
-                        item = q.pop(0)
-                        sr["queue"] = q
-                        prompt = begin_session(state, item)
-                        if set_stage(state, "session_active"):
-                            sp2 = SystemMessage(content=_build_system_prompt_session())
-                            prior_messages.append(sp2)
-                            _persist_chat_message(session_id, "system", sp2)
-                        human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
-                    else:
-                        human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
+    else:
+        # No active session
+        now = datetime.utcnow()
+        user_text_norm = (user_message or "").strip().lower()
+        if get_stage(state) == "kickoff":
+            # Gate on readiness (treat any substantive response as readiness too)
+            substantive = len(user_text.strip()) >= 2 and user_text_norm not in {"no", "not yet", "later"}
+            if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"} or substantive:
+                # Start earliest item now
+                q = sr.get("queue", []) or []
+                if q:
+                    item = q.pop(0)
+                    sr["queue"] = q
+                    prompt = begin_session(state, item)
+                    if set_stage(state, "session_active"):
+                        sp2 = SystemMessage(content=_build_system_prompt_session())
+                        prior_messages.append(sp2)
+                        _persist_chat_message(session_id, "system", sp2)
+                    human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
                 else:
-                    human_content = [{"type": "text", "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'."}]
+                    human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
             else:
-                # Non-kickoff idle path: due check or small talk
-                due = get_next_due(state, now=now)
-                if due is not None:
-                    item = pop_next_due(state, now=now)
-                    if item is not None:
-                        prompt = begin_session(state, item)
-                        if set_stage(state, "session_active"):
-                            prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
-                        human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
-                    else:
-                        human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
+                human_content = [{"type": "text", "text": "Please confirm you're ready and we'll begin: say 'ready' or 'begin'."}]
+        else:
+            # Non-kickoff idle path: due check or small talk
+            due = get_next_due(state, now=now)
+            if due is not None:
+                item = pop_next_due(state, now=now)
+                if item is not None:
+                    prompt = begin_session(state, item)
+                    if set_stage(state, "session_active"):
+                        prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
+                    human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
                 else:
-                    if set_stage(state, "waiting"):
-                        spw = SystemMessage(content=_build_system_prompt_waiting())
-                        prior_messages.append(spw)
-                        _persist_chat_message(session_id, "system", spw)
-                    if user_text_norm in {"begin", "start", "next", "go", "ready"}:
-                        msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
-                    else:
-                        msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
-                    human_content = [{"type": "text", "text": msg}]
+                    human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
+            else:
+                if set_stage(state, "waiting"):
+                    spw = SystemMessage(content=_build_system_prompt_waiting())
+                    prior_messages.append(spw)
+                    _persist_chat_message(session_id, "system", spw)
+                if user_text_norm in {"begin", "start", "next", "go", "ready"}:
+                    msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
+                else:
+                    msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
+                human_content = [{"type": "text", "text": msg}]
 
         # Append control instruction only; do not re-add system prompts on chat turns
         next_hm = HumanMessage(content=human_content)
