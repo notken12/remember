@@ -46,7 +46,9 @@ async def event_generator():
 
 
 @app.post("/current_transcription")
-async def set_current_transcription(text: str):
-    msg = json.dumps({"type": "data-transcription", "data": {"text": text}})
+async def set_current_transcription(text: str, is_final: bool):
+    msg = json.dumps(
+        {"type": "data-transcription", "data": {"text": text, "is_final": is_final}}
+    )
     r.publish("web_stream", msg)
     return

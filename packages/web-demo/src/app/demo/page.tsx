@@ -19,6 +19,8 @@ export default function DemoPage() {
     const streamRef = useRef<ReadableStream<UIMessageChunk> | null>(null)
     const sseRef = useRef<EventSource | null>(null)
     const isCleaningUpRef = useRef(false)
+    const [transcription, setTranscription] = useState('')
+    const [transcriptionIsFinal, setTranscriptionIsFinal] = useState(false)
 
     useEffect(() => {
         console.log('loading sse')
@@ -36,6 +38,11 @@ export default function DemoPage() {
                         try {
                             // Parse the event data and enqueue it
                             const data = JSON.parse(event.data);
+                            if (data.type === 'data-transcription') {
+                                setTranscription(data.data.text)
+                                setTranscriptionIsFinal(data.data.isFinal)
+                                console.log('transcription: ', data.data.text)
+                            }
                             controller.enqueue(data);
                         } catch (error) {
                             console.error('Error parsing SSE data:', error);
@@ -69,7 +76,6 @@ export default function DemoPage() {
         const processUIMessageStream = async (stream: ReadableStream<UIMessageChunk>) => {
             try {
                 for await (const uiMessage of readUIMessageStream({ stream })) {
-                    console.log('UI Message received:', uiMessage)
                     setMessages(produce(prev => {
                         // Avoid duplicates by checking if message already exists
                         const index = prev.findIndex(m => m.id === uiMessage.id);
@@ -101,31 +107,38 @@ export default function DemoPage() {
     return (
         <div className="absolute inset-0">
             <WebcamBackground />
-            <ol className="m-4 max-h-full overflow-y-auto">
-                {messages.map((msg, msgIndex) => {
-                    return (
-                        <li
-                            key={msg.id || `msg-${msgIndex}`}
-                            className={cn(
-                                "p-3 rounded-lg backdrop-blur-sm",
-                                {
-                                    "bg-blue-500/80 text-white ml-8": msg.role === "user",
-                                    "bg-white/80 text-black mr-8": msg.role === "assistant"
-                                }
-                            )}
-                        >
-                            {msg.parts.map((part, partIndex) => {
-                                switch (part.type) {
-                                    case "text":
-                                        return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
-                                    default:
-                                        return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
-                                }
-                            })}
-                        </li>
-                    )
-                })}
-            </ol>
+            <div className="absolute inset-0 p-4">
+                <ol className="max-h-full overflow-y-auto">
+                    {messages.map((msg, msgIndex) => {
+                        if (!msg.parts.some(p => !p.type.startsWith('data-'))) return null
+                        return (
+                            <li
+                                key={msg.id || `msg-${msgIndex}`}
+                                className={cn(
+                                    "p-3 rounded-lg backdrop-blur-sm",
+                                    {
+                                        "bg-blue-500/80 text-white ml-8": msg.role === "user",
+                                        "bg-white/80 text-black mr-8": msg.role === "assistant"
+                                    }
+                                )}
+                            >
+                                {msg.parts.map((part, partIndex) => {
+                                    switch (part.type) {
+                                        case "text":
+                                            return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        default:
+                                            if (part.type.startsWith('data-')) return null
+                                            return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
+                                    }
+                                })}
+                            </li>
+                        )
+                    })}
+                    <li className={cn("text-foreground", { "opacity-70": !transcriptionIsFinal })}>
+                        {transcription}
+                    </li>
+                </ol>
+            </div>
         </div>
     )
 }

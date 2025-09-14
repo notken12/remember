@@ -33,7 +33,7 @@ class MyMentraOSApp extends AppServer {
 
     session.events.onTranscription(async (data) => {
       // session.logger.info(`Transcription: ${data.text}`)
-      const searchParams = new URLSearchParams({ text: data.text })
+      const searchParams = new URLSearchParams({ text: data.text, is_final: data.isFinal.toString() })
       const url = process.env.BACKEND_URL + "/current_transcription?" + searchParams.toString()
       await fetch(url, {
         method: "POST",
