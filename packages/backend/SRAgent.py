@@ -4,9 +4,12 @@
 Spaced Retrieval (SR) Agent skeleton.
 
 This module defines the public interface and internal structure for a Spaced
-Retrieval therapy agent that follows an Episodic Specificity Induction (ESI)
-session. The SR agent schedules short, repeated recall sessions for selected
-video clips using increasing time intervals (e.g., 30s → 1m → 2m → 4m),
+Retrieval therapy agent that runs after an Episodic Specificity Induction (ESI)
+session has completed. Importantly, SR does not consume or depend on any ESI
+outputs. SR independently sources clips from Supabase (for now via a
+hardcoded/known table and columns; in the future, via dynamic discovery of
+recent/past clips). The SR agent schedules short, repeated recall sessions for
+those clips using increasing time intervals (e.g., 30s → 1m → 2m → 4m),
 adapting progression based on patient performance.
 
 NOTE: This file intentionally provides method signatures and detailed
