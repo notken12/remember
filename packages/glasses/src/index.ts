@@ -8,6 +8,7 @@ const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SE
 const PACKAGE_NAME = process.env.PACKAGE_NAME || "com.example.myfirstmentraosapp"
 const PORT = parseInt(process.env.PORT || "3000")
 const MENTRAOS_API_KEY = process.env.MENTRAOS_API_KEY
+const WAKE_WORD = process.env.WAKE_WORD || "jarvis"
 
 if (!MENTRAOS_API_KEY) {
   console.error("MENTRAOS_API_KEY environment variable is required")
@@ -20,6 +21,7 @@ class MyMentraOSApp extends AppServer {
 
     let currentEsiSessionId: string | null = null
     let currentSRSessionId: string | null = null
+    let wakeWordDetected = false
     let aiTalking = false
     let accumulatedTranscription = ""
 
@@ -66,6 +68,17 @@ class MyMentraOSApp extends AppServer {
           }
           aiTalking = false
           session.logger.info(`Accumulated transcription button-submitted to SR session`)
+        } else if (wakeWordDetected) {
+          session.logger.info(`Button-submitting accumulated transcription to Assistant chat: ${accumulatedTranscription}`)
+          const chatParams = new URLSearchParams({ user_message: accumulatedTranscription })
+          const chatUrl = process.env.BACKEND_URL + "/assistant_chat?" + chatParams.toString()
+          aiTalking = true
+          const response = await fetch(chatUrl, {
+            method: "POST",
+          })
+          const responseText = await response.text()
+          aiTalking = false
+          session.logger.info(`Accumulated transcription button-submitted to Assistant chat`)
         }
 
         // Clear the accumulated transcription after successful submission
@@ -94,6 +107,20 @@ class MyMentraOSApp extends AppServer {
       if (data.isFinal) {
         accumulatedTranscription += (accumulatedTranscription ? " " : "") + data.text
         session.logger.info(`Accumulated transcription: ${accumulatedTranscription}`)
+
+        // Check for wake word to start assistant session
+        if (data.text.toLowerCase().includes(WAKE_WORD) && !aiTalking && !wakeWordDetected) {
+          session.logger.info(`Wake word detected, querying Assistant`)
+          wakeWordDetected = true
+          const searchParams = new URLSearchParams({ user_message: accumulatedTranscription })
+          const url = process.env.BACKEND_URL + "/assistant_chat?" + searchParams.toString()
+          aiTalking = true
+          await fetch(url, {
+            method: "POST",
+          })
+          aiTalking = false
+          session.logger.info(`Assistant query started`)
+        }
       }
 
       const searchParams = new URLSearchParams({ text: data.text, is_final: data.isFinal.toString() })
@@ -121,19 +148,9 @@ class MyMentraOSApp extends AppServer {
       // }
     })
 
-    const statusUnsubscribe = session.camera.onManagedStreamStatus((data) => {
-      session.logger.info(`Managed stream status: ${JSON.stringify(data, null, 2)}`)
-    })
-
-    const photoInterval = setInterval(async () => {
-      // const photo = await session.camera.requestPhoto({ saveToGallery: true })
-    }, 5000)
-
     // Log when the session is disconnected
     session.events.onDisconnected(() => {
       session.logger.info(`Session ${sessionId} disconnected.`)
-      clearInterval(photoInterval)
-      statusUnsubscribe()
     })
   }
 }
