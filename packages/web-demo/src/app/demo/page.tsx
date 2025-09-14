@@ -13,6 +13,7 @@ import { produce } from 'immer'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { readUIMessageStream, UIMessage, UIMessageChunk } from 'ai';
 import { cn } from '@/lib/utils';
+import Image from 'next/image';
 
 export default function DemoPage() {
     const [messages, setMessages] = useState<UIMessage[]>([])
@@ -153,6 +154,23 @@ export default function DemoPage() {
                                     switch (part.type) {
                                         case "text":
                                             return <p key={partIndex} className="whitespace-pre-wrap">{part.text}</p>
+                                        case "tool-show_image":
+                                            return (
+                                                <video
+                                                    src={part.output?.url}
+                                                    className="max-w-96 max-h-96"
+                                                    muted
+                                                    preload="metadata"
+                                                />
+                                            )
+                                        case "tool-show_video_slice":
+                                            return (
+                                                <VideoSlice url={part.output?.url} start={part.input?.start} end={part.input?.end} />
+                                            )
+                                        case "tool-end_esi_session":
+                                            return <p>ESI session complete! Now let{"'"}s move on to spaced repetition.</p>
+                                        case "tool-end_sr_session":
+                                            return <p>SR session complete! You{"'"}re all done, congratulations!</p>
                                         default:
                                             if (part.type.startsWith('data-')) return null
                                             return <div key={partIndex} className="text-xs opacity-70">{JSON.stringify(part)}</div>
@@ -168,6 +186,72 @@ export default function DemoPage() {
             </div>
         </div>
     )
+}
+
+function VideoSlice({ url, start, end }: { url: string, start: number, end: number }) {
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const [isLoaded, setIsLoaded] = useState(false);
+
+    useEffect(() => {
+        const video = videoRef.current;
+        if (!video) return;
+
+        const handleLoadedMetadata = () => {
+            // Set the video to start at the specified start time
+            video.currentTime = start;
+            setIsLoaded(true);
+        };
+
+        const handleLoadedData = () => {
+            // Auto-play once the video data is loaded
+            video.play().catch(error => {
+                console.error('Error playing video:', error);
+            });
+        };
+
+        const handleTimeUpdate = () => {
+            // Stop the video when it reaches the end time
+            if (video.currentTime >= end) {
+                video.pause();
+                video.currentTime = start; // Reset to start for potential replay
+            }
+        };
+
+        const handleSeeked = () => {
+            // Ensure we don't seek outside our allowed range
+            if (video.currentTime < start) {
+                video.currentTime = start;
+            } else if (video.currentTime > end) {
+                video.currentTime = end;
+                video.pause();
+            }
+        };
+
+        // Add event listeners
+        video.addEventListener('loadedmetadata', handleLoadedMetadata);
+        video.addEventListener('loadeddata', handleLoadedData);
+        video.addEventListener('timeupdate', handleTimeUpdate);
+        video.addEventListener('seeked', handleSeeked);
+
+        return () => {
+            // Cleanup event listeners
+            video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+            video.removeEventListener('loadeddata', handleLoadedData);
+            video.removeEventListener('timeupdate', handleTimeUpdate);
+            video.removeEventListener('seeked', handleSeeked);
+        };
+    }, [start, end]);
+
+    return (
+        <video
+            ref={videoRef}
+            src={url}
+            className="max-w-96 max-h-96"
+            controls
+            preload="metadata"
+            muted
+        />
+    );
 }
 
 export function WebcamBackground() {
