@@ -181,8 +181,16 @@ class QueueItem:
             message payload. The `questions` will be stored minimally by their
             cue/answer; the `clip_id` is persisted by value.
         """
-        # No implementation yet
-        pass
+        return {
+            "clip_id": self.clip_id,
+            "next_at": self.next_at.isoformat(),
+            "interval_index": int(self.interval_index),
+            "attempt_count": int(self.attempt_count),
+            "questions": [
+                {"text_cue": q.text_cue, "answer": q.answer} for q in self.questions
+            ],
+            "meta": dict(self.meta) if self.meta is not None else {},
+        }
 
     @staticmethod
     def from_state(state: Dict[str, Any]) -> "QueueItem":
@@ -196,8 +204,38 @@ class QueueItem:
             `questions` will be reconstructed into `Question` objects. Any
             unknown fields should be ignored.
         """
-        # No implementation yet
-        pass
+        # Extract and normalize fields with basic validation
+        clip_id = str(state.get("clip_id", ""))
+        next_at_str = str(state.get("next_at", ""))
+        interval_index = int(state.get("interval_index", 0))
+        attempt_count = int(state.get("attempt_count", 0))
+        meta = state.get("meta", {}) or {}
+
+        try:
+            next_at_dt = datetime.fromisoformat(next_at_str.replace("Z", "+00:00"))
+        except Exception:
+            # Fallback to immediate due if timestamp missing/invalid
+            next_at_dt = datetime.utcnow()
+
+        questions_payload = state.get("questions", []) or []
+        questions: List[Question] = []
+        for item in questions_payload:
+            try:
+                text_cue = str(item.get("text_cue", "")).strip()
+                answer = str(item.get("answer", "")).strip()
+            except Exception:
+                text_cue = ""
+                answer = ""
+            questions.append(Question(video_clip=None, text_cue=text_cue, answer=answer))
+
+        return QueueItem(
+            clip_id=clip_id,
+            questions=questions,
+            next_at=next_at_dt,
+            interval_index=interval_index,
+            attempt_count=attempt_count,
+            meta=meta,
+        )
 
 
 class SRAgent:
@@ -254,8 +292,24 @@ class SRAgent:
             - Load any serialized SR state previously saved for this session and
               hydrate in-memory queues so chat resumes seamlessly.
         """
-        # No implementation yet
-        pass
+        # In-memory state (mirrors AgentGraphState.sr)
+        self._interval_seconds: List[int] = (
+            list(interval_seconds) if interval_seconds else list(DEFAULT_INTERVAL_SECONDS)
+        )
+        self._questions_per_clip: int = int(questions_per_clip)
+        # Priority queue stored as a simple list; implementations will use heapq
+        self._queue: List[QueueItem] = []
+        # Cache of prepared questions per clip_id
+        self._clip_questions: Dict[str, List[Question]] = {}
+        # Deterministic subset chosen for this SR run
+        self._selected_clips: List[str] = []
+        # Active session state (None or dict-like mirror of ActiveSessionState)
+        self._active_session: Optional[Dict[str, Any]] = None
+        # Timestamps and misc
+        self._last_activity_at: Optional[datetime] = None
+        # Chat session placeholder (LangGraph may manage persistence separately)
+        self.session = session  # type: ignore[assignment]
+        self.session_id = session_id
 
     # ---------------------------------------------------------------------
     # Public API
@@ -594,9 +648,20 @@ class SRAgent:
         the call. This method should only read from that in-memory state and
         populate local structures (e.g., priority queue) as needed. It should
         not perform direct database I/O.
+
+        Expected AgentGraphState keys used:
+            - sr.interval_seconds: List[int]
+            - sr.queue: List[QueueItemState]
+            - sr.clip_questions: Dict[str, List[QuestionState]]
+            - sr.selected_clips: List[str]
+            - sr.active_session: ActiveSessionState | None
+            - sr.last_activity_at: str (ISO) | missing
+
+        Implementations should ensure safety if keys are missing.
         """
-        # No implementation yet
-        pass
+        # This method will be completed when the AgentGraphState instance is
+        # passed into SRAgent. For now, leave logic to phase-2/3 integration.
+        return
 
     def save_sr_state(self) -> None:
         """Project in-memory changes back into AgentGraphState (no direct I/O).
@@ -605,9 +670,18 @@ class SRAgent:
         AgentGraphState with the latest queue contents, interval indices, and
         any clip/question caches. The orchestrator will persist state at the end
         of the call.
+
+        Expected AgentGraphState keys to write:
+            - sr.interval_seconds
+            - sr.queue (serialize QueueItem → QueueItemState)
+            - sr.clip_questions (serialize Question → QuestionState)
+            - sr.selected_clips
+            - sr.active_session
+            - sr.last_activity_at (ISO timestamp)
         """
-        # No implementation yet
-        pass
+        # This method will be completed when we accept an AgentGraphState
+        # instance in the public API and can write into it. Left for next phase.
+        return
 
     def save_turn_messages(self, user_text: str, assistant_text: str) -> None:
         """Record turn messages into AgentGraphState; runtime persists as needed.
