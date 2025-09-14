@@ -121,13 +121,29 @@ def _serialize_message_for_log(message: Any) -> Dict[str, Any]:
     }
 
 
+SR_STATE_PREFIX = "SR_STATE::"
+
+
+def _is_sr_state_marker_message(message: Any) -> bool:
+    try:
+        if isinstance(message, SystemMessage):
+            content = getattr(message, "content", "")
+            return isinstance(content, str) and content.startswith(SR_STATE_PREFIX)
+    except Exception:
+        return False
+    return False
+
+
 def _log_llm_prompt(state: Dict[str, Any], when: str = "before_invoke") -> None:
     try:
         logger = _initialize_logger()
     except Exception:
         return
     try:
-        messages = state.get("messages", []) or []
+        # Exclude SR state marker messages from logs
+        messages = [
+            m for m in (state.get("messages", []) or []) if not _is_sr_state_marker_message(m)
+        ]
         serialized = []
         for m in messages:
             try:
@@ -196,6 +212,65 @@ def prepare_video_context(clip_uuids: List[str]) -> List[MediaPart]:
             continue
 
     return media_parts
+# ---------------------------------------------------------------------
+# SR state persistence via special system message marker (Option B)
+# ---------------------------------------------------------------------
+
+def _sr_slice_to_marker(sr_slice: Dict[str, Any]) -> SystemMessage:
+    try:
+        payload = json.dumps(sr_slice, ensure_ascii=False)
+    except Exception:
+        payload = "{}"
+    return SystemMessage(content=f"{SR_STATE_PREFIX}{payload}")
+
+
+def _extract_sr_slice_from_messages(messages: List[Any]) -> Optional[Dict[str, Any]]:
+    # Scan newest to oldest for the most recent SR state marker
+    try:
+        for m in reversed(messages or []):
+            try:
+                if isinstance(m, SystemMessage):
+                    content = getattr(m, "content", "")
+                    if isinstance(content, str) and content.startswith(SR_STATE_PREFIX):
+                        raw = content[len(SR_STATE_PREFIX) :]
+                        data = json.loads(raw)
+                        if isinstance(data, dict):
+                            return data  # type: ignore[return-value]
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _persist_messages_to_supabase(session_id: str, new_messages: List[Any]) -> None:
+    try:
+        for msg in new_messages:
+            data_payload = getattr(msg, "__dict__", None)
+            if data_payload is None:
+                if isinstance(msg, dict):
+                    data_payload = msg
+                else:
+                    data_payload = {"content": str(getattr(msg, "content", msg))}
+            # Derive role for convenience/debugging (Supabase row also stores data.type)
+            role = "system"
+            if isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            elif getattr(msg, "type", "") == "tool":
+                role = "tool"
+            supabase.table("chat_messages").insert(
+                {
+                    "role": role,
+                    "data": data_payload,
+                    "session_id": str(session_id),
+                }
+            ).execute()
+    except Exception:
+        # Non-fatal; continue
+        pass
+
 
 
 # ---------------------------------------------------------------------
@@ -913,6 +988,13 @@ class SRAgentRunner:
             pass
         # Initialize config/defaults on sr slice
         configure_sr_from_env(state)
+        # Rehydrate SR slice from latest persisted marker message, if any
+        try:
+            persisted_sr = _extract_sr_slice_from_messages(state.get("messages", []) or [])
+            if isinstance(persisted_sr, dict):
+                state["sr"] = persisted_sr
+        except Exception:
+            pass
 
         # Discover and select
         candidates = load_recent_video_ids(state)
@@ -1045,6 +1127,19 @@ class SRAgentRunner:
             ),
             SystemMessage(content=kickoff_instruction),
         ]
+        # Persist kickoff messages so history is durable
+        try:
+            _persist_messages_to_supabase(self.session_id, state["messages"])
+        except Exception:
+            pass
+        # Persist SR slice marker after kickoff configuration
+        try:
+            sr_slice = ensure_sr_slice(state)
+            marker_msg = _sr_slice_to_marker(sr_slice)
+            state["messages"].append(marker_msg)
+            _persist_messages_to_supabase(self.session_id, [marker_msg])
+        except Exception:
+            pass
 
         # Persist SR slice in memory for continuity when no external checkpointer is present
         if hasattr(self, "_memory_state"):
@@ -1065,6 +1160,13 @@ class SRAgentRunner:
             state["session_id"] = self.session_id
         except Exception:
             pass
+        # Rehydrate SR slice from latest persisted marker message, if any
+        try:
+            persisted_sr = _extract_sr_slice_from_messages(state.get("messages", []) or [])
+            if isinstance(persisted_sr, dict):
+                state["sr"] = persisted_sr
+        except Exception:
+            pass
         sr = ensure_sr_slice(state)
         sr["last_activity_at"] = _to_iso(datetime.utcnow())
 
@@ -1075,7 +1177,12 @@ class SRAgentRunner:
         prior_messages = state.get("messages", []) or []
         user_text = user_message or ""
         if user_text:
-            prior_messages = prior_messages + [HumanMessage(content=user_text)]
+            human_msg = HumanMessage(content=user_text)
+            prior_messages = prior_messages + [human_msg]
+            try:
+                _persist_messages_to_supabase(self.session_id, [human_msg])
+            except Exception:
+                pass
         if isinstance(sess, dict):
             # On transition into session_active, append stage system prompt once
             if set_stage(state, "session_active"):
@@ -1216,7 +1323,19 @@ class SRAgentRunner:
         # Append control instruction only; do not re-add system prompts on chat turns
         if 'system_next' in locals():
             prior_messages.append(system_next)
+            try:
+                _persist_messages_to_supabase(self.session_id, [system_next])
+            except Exception:
+                pass
         state["messages"] = prior_messages
+        # Persist SR slice marker after any SR state mutation on this turn
+        try:
+            sr_slice = ensure_sr_slice(state)
+            marker_msg = _sr_slice_to_marker(sr_slice)
+            state["messages"].append(marker_msg)
+            _persist_messages_to_supabase(self.session_id, [marker_msg])
+        except Exception:
+            pass
 
         # Persist SR slice in memory for continuity when no external checkpointer is present
         if hasattr(self, "_memory_state"):
@@ -1251,8 +1370,15 @@ def sr_agent_node(state: State) -> State:
         model="gemini-2.5-flash",
         model_provider="google_genai",
     )
-    message = llm.invoke(state["messages"])
+    # Exclude SR state marker messages from the prompt sent to the LLM
+    prompt_messages = [m for m in state["messages"] if not _is_sr_state_marker_message(m)]
+    message = llm.invoke(prompt_messages)
     state["messages"].append(message)
+    # Persist assistant reply for durable history
+    try:
+        _persist_messages_to_supabase(str(state.get("session_id", "")), [message])
+    except Exception:
+        pass
     return state
 
 

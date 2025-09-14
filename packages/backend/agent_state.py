@@ -1,5 +1,5 @@
 from typing import Annotated, TypedDict
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage, SystemMessage
 from langgraph.graph import add_messages
 
 from supabase_client import supabase
@@ -21,6 +21,8 @@ def json_to_message(json: dict):
         return AIMessage(**json)
     elif message_type == "tool":
         return ToolMessage(**json)
+    elif message_type == "system":
+        return SystemMessage(**json)
     else:
         raise ValueError(f"Unknown message type: {message_type}. Message: {json}")
 
