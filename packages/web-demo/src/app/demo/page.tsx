@@ -100,11 +100,11 @@ export default function DemoPage() {
                         controller.enqueue(data);
                     }
                 } catch (error) {
-                    console.error('Error parsing SSE data:', error);
+                    console.log('Error parsing SSE data:', error);
                 }
             };
             sse.onerror = (error) => {
-                console.error('SSE error:', error);
+                console.log('SSE error:', error);
                 controller?.error(error);
             };
 
@@ -118,7 +118,7 @@ export default function DemoPage() {
                     setMessages([uiMessage])
                 }
             } catch (error) {
-                console.error('Error processing UI message stream:', error);
+                console.log('Error processing UI message stream:', error);
                 // Don't close the stream on error, just log it
             }
         };
@@ -203,7 +203,7 @@ export default function DemoPage() {
 const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_API_KEY!)
 
 function Video({ uuid, ...restProps }: { uuid: string } & React.ComponentProps<'video'>) {
-    const [url, setUrl] = useState('')
+    const [url, setUrl] = useState<string | null>(null)
     useEffect(() => {
         (async () => {
             const { data } = await supabase.from('videos').select('video_path').eq("id", uuid).single().throwOnError()
@@ -219,7 +219,7 @@ function Video({ uuid, ...restProps }: { uuid: string } & React.ComponentProps<'
 function VideoSlice({ uuid, start, end }: { uuid: string, start: number, end: number }) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const [isLoaded, setIsLoaded] = useState(false);
-    const [url, setUrl] = useState('')
+    const [url, setUrl] = useState<string | null>(null)
 
     useEffect(() => {
         (async () => {
@@ -239,7 +239,7 @@ function VideoSlice({ uuid, start, end }: { uuid: string, start: number, end: nu
         const handleLoadedData = () => {
             // Auto-play once the video data is loaded
             video.play().catch(error => {
-                console.error('Error playing video:', error);
+                console.log('Error playing video:', error);
             });
         };
 
