@@ -778,7 +778,9 @@ def _build_system_prompt_session() -> str:
     return (
         "Active session stage: For each turn after the user answers, include a brief correctness judgment. "
         "If incorrect, include the correct answer once. Then naturally segue into the next question exactly as provided. "
-        "No greetings; do not ask about readiness. Keep it human-sounding and concise."
+        "No greetings; do not ask about readiness. Keep it human-sounding and concise. "
+        "NEVER output the word 'next' as a standalone reply. Do not apologize or add meta comments. "
+        "If given an instruction like 'Say only this question exactly: <Q>', output exactly <Q> with no extra words, no quotes, no prefixes, and no suffixes."
     )
 
 
@@ -903,29 +905,25 @@ async def kickoff(session_id: str) -> AsyncGenerator[StreamProtocolPart, None]:
 
     # Build streaming payload
     master_prompt = _build_system_prompt_master()
-    if first_prompt:
-        human_content: List[Any] = [
-            {"type": "text", "text": f"Ask exactly this question to begin: {first_prompt}"},
-        ]
-    else:
-        n = len(sr.get("enqueued_clips", []))
-        if n == 0:
-            _log_sr_error(state, "Selected clips, but none enqueued (no questions)")
-        human_content = [
-            {"type": "text", "text": f"We will practice recall for {n} short clips. Ask exactly: Are you ready to begin?"},
-        ]
     stage_prompt = _build_system_prompt_kickoff()
-    state["messages"] = [
+    messages: List[Any] = [
         SystemMessage(content=master_prompt),
         SystemMessage(content=stage_prompt),
+        # Media context as a HumanMessage; Gemini system instructions must be text-only
         HumanMessage(
             content=[
                 {"type": "text", "text": "Context: media for all selected clips (reference these clips during this SR session)."},
                 *media_parts_all,
             ]
         ),
-        HumanMessage(content=human_content),
     ]
+    if first_prompt:
+        messages.append(SystemMessage(content=f"Say only this question exactly: {first_prompt}", name="next_question"))
+    else:
+        messages.append(SystemMessage(content="Your very next response must be exactly: Are you ready to begin?", name="kickoff_directive"))
+    # Seed a minimal human turn so the chat model has user content to respond to
+    messages.append(HumanMessage(content="hi"))
+    state["messages"] = messages
     # Persist kickoff messages to Supabase
     for m in state["messages"]:
         role = "system" if isinstance(m, SystemMessage) else "user"
@@ -996,7 +994,8 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
 
     # If session active: record answer and determine next step
     sess = sr.get("active_session")
-    human_content: List[Any]
+    human_content: Optional[List[Any]] = None
+    append_control_human = True
     # Always append the user's utterance to history first to preserve continuity
     prior_messages = state.get("messages", []) or []  # type: ignore[index]
     user_text = (user_message or "")
@@ -1048,18 +1047,15 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
 
             if not session_finished(state):
                 prompt = current_prompt(state) or "Notice one concrete detail you remember from this clip."
-                clip_id = str(sess.get("clip_id", ""))
-                # Do not reattach media; it was attached once at kickoff
-                human_content = [
-                    {"type": "text", "text": " ".join(feedback_lines) + f"\nNext question (ask exactly as written): {prompt}"},
-                ]
+                feedback_text = "Correct." if eval_res.get("correct") else ("That's not quite right." + (f" Correct answer: {str(eval_res.get('correct_answer','')).strip()}" if str(eval_res.get("correct_answer","")) else ""))
+                prior_messages.append(SystemMessage(content=f"Say exactly this feedback: {feedback_text} Then say only this question exactly: {prompt}", name="feedback_and_next"))
+                append_control_human = False
             else:
                 result = evaluate_session(state)
                 reschedule(state, success=bool(result.get("success", False)), now=datetime.utcnow())
                 summary = "Session complete. " + ("Strong recall." if result.get("success") else "We will revisit soon to reinforce.")
-                human_content = [
-                    {"type": "text", "text": summary},
-                ]
+                prior_messages.append(SystemMessage(content=f"Say exactly: {summary}", name="session_complete"))
+                append_control_human = False
     else:
         # No active session
         now = datetime.utcnow()
@@ -1078,7 +1074,8 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                         sp2 = SystemMessage(content=_build_system_prompt_session())
                         prior_messages.append(sp2)
                         _persist_chat_message(session_id, "system", sp2)
-                    human_content = [{"type": "text", "text": f"Ask exactly this to begin: {prompt}"}]
+                    prior_messages.append(SystemMessage(content=f"Say only this question exactly: {prompt}", name="next_question"))
+                    append_control_human = False
                 else:
                     human_content = [{"type": "text", "text": "We don't have a clip ready yet. Give me a moment."}]
             else:
@@ -1092,7 +1089,8 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                     prompt = begin_session(state, item)
                     if set_stage(state, "session_active"):
                         prior_messages.append(SystemMessage(content=_build_system_prompt_session()))
-                    human_content = [{"type": "text", "text": f"Ask exactly this to begin the next session: {prompt}"}]
+                    prior_messages.append(SystemMessage(content=f"Say only this question exactly: {prompt}", name="next_question"))
+                    append_control_human = False
                 else:
                     human_content = [{"type": "text", "text": "Acknowledge and offer a brief supportive remark while waiting."}]
             else:
@@ -1100,16 +1098,16 @@ async def chat(session_id: str, user_message: str) -> AsyncGenerator[StreamProto
                     spw = SystemMessage(content=_build_system_prompt_waiting())
                     prior_messages.append(spw)
                     _persist_chat_message(session_id, "system", spw)
-                if user_text_norm in {"begin", "start", "next", "go", "ready"}:
-                    msg = "Great—I'm ready when you are. We'll start as soon as the next memory check is scheduled."
-                else:
-                    msg = "We're giving your mind a short breather. When you're ready, say 'next' and we'll continue."
-                human_content = [{"type": "text", "text": msg}]
+                prior_messages.append(SystemMessage(content="Say exactly one short supportive sentence (no links).", name="waiting_directive"))
+                append_control_human = False
 
         # Append control instruction only; do not re-add system prompts on chat turns
-        next_hm = HumanMessage(content=human_content)
-        state["messages"] = prior_messages + [next_hm]  # type: ignore[index]
-        _persist_chat_message(session_id, "user", next_hm)
+        if append_control_human and human_content:
+            next_hm = HumanMessage(content=human_content)
+            state["messages"] = prior_messages + [next_hm]  # type: ignore[index]
+            _persist_chat_message(session_id, "user", next_hm)
+        else:
+            state["messages"] = prior_messages  # type: ignore[index]
         # Persist updated SR slice for this turn
         _append_and_persist_sr_state(session_id, state)
 
