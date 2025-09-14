@@ -517,8 +517,46 @@ class SRAgent:
         Returns:
             Mapping from `clip_id` → list of `Question` objects.
         """
-        # No implementation yet
-        pass
+        # Normalize and de-duplicate while preserving original order
+        seen: set[str] = set()
+        ordered_ids: List[str] = []
+        for cid in clip_ids:
+            if not cid:
+                continue
+            if cid in seen:
+                continue
+            seen.add(cid)
+            ordered_ids.append(cid)
+
+        target_count = int(questions_per_clip) if questions_per_clip else self._questions_per_clip
+        if target_count <= 0:
+            target_count = self._questions_per_clip
+
+        results: Dict[str, List[Question]] = {}
+
+        for clip_id in ordered_ids:
+            # Serve from cache when possible
+            cached = self._clip_questions.get(clip_id)
+            if isinstance(cached, list) and cached:
+                results[clip_id] = list(cached[:target_count])
+                continue
+
+            try:
+                clip = VideoClip(clip_id)
+                generator = QuestionGenerator(clip)
+                questions = generator.generate(num_questions=target_count)
+                if questions:
+                    # Cache full set; return up to target_count
+                    self._clip_questions[clip_id] = list(questions)
+                    results[clip_id] = list(questions[:target_count])
+                else:
+                    # Leave uncached to allow retry on subsequent calls
+                    results[clip_id] = []
+            except Exception:
+                # Robust to per-clip failures; continue with next clip
+                results[clip_id] = []
+
+        return results
 
     # ---------------------------------------------------------------------
     # Scheduling and queue management
