@@ -78,6 +78,7 @@ class TestRunnerFlow(unittest.IsolatedAsyncioTestCase):
         # Use fallback to avoid depending on Supabase for discovery
         os.environ["SR_FALLBACK_CLIP_IDS"] = "fake1,fake2"
         os.environ["SR_MAX_CLIPS"] = "1"
+        os.environ["SR_FAST_START"] = "1"
         self.runner = SRAgentRunner(session_id="test_sr_phase_flow")
 
     async def test_fast_start_and_media_once(self):

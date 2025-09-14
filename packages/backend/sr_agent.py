@@ -658,10 +658,20 @@ class SRAgentRunner:
             state = snapshot.values
         except Exception:
             state = {}
+        # Merge in-memory SR slice for continuity when no checkpointer is available
+        mem_sr: Optional[Dict[str, Any]] = None
+        if hasattr(self, "_memory_state") and isinstance(getattr(self, "_memory_state", {}).get("sr"), dict):
+            mem_sr = getattr(self, "_memory_state")["sr"]  # type: ignore[index]
         if not state and hasattr(self, "_memory_state"):
             state = self._memory_state
-        if "sr" not in state or not isinstance(state.get("sr"), dict):
+        # Prefer memory SR if available to avoid losing stage/active_session between turns
+        if isinstance(mem_sr, dict):
+            state["sr"] = mem_sr
+        elif "sr" not in state or not isinstance(state.get("sr"), dict):
             state["sr"] = {}
+            # Seed memory with a fresh sr slice so subsequent turns persist
+            if hasattr(self, "_memory_state"):
+                self._memory_state["sr"] = state["sr"]
         return state
 
     async def kickoff(self) -> AsyncGenerator[StreamProtocolPart, None]:
@@ -771,6 +781,13 @@ class SRAgentRunner:
             ),
             HumanMessage(content=human_content),
         ]
+
+        # Persist SR slice in memory for continuity when no external checkpointer is present
+        if hasattr(self, "_memory_state"):
+            try:
+                self._memory_state["sr"] = ensure_sr_slice(state)
+            except Exception:
+                pass
 
         async for part in parse_langgraph_stream(
             self._agent.astream(state, config=self.config, stream_mode="messages")
@@ -882,6 +899,13 @@ class SRAgentRunner:
         state["messages"] = prior_messages + [
             HumanMessage(content=human_content),
         ]
+
+        # Persist SR slice in memory for continuity when no external checkpointer is present
+        if hasattr(self, "_memory_state"):
+            try:
+                self._memory_state["sr"] = ensure_sr_slice(state)
+            except Exception:
+                pass
 
         async for part in parse_langgraph_stream(
             self._agent.astream(state, config=self.config, stream_mode="messages")
