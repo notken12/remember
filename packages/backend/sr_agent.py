@@ -11,6 +11,8 @@ from SRQuestionGenerator import QuestionGenerator
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.prebuilt import create_react_agent
+from langgraph.graph import START, StateGraph
+from agent_state import State
 # from postgres import AsyncPostgresSaver  # Lazily imported in _initialize_agent to avoid libpq issues in tests
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
@@ -1029,6 +1031,43 @@ class SRAgentRunner:
         ):
             yield part
 
+
+# ---------------------------------------------------------------------
+# LangGraph nodes and compiled graph (mirroring esi_agent.py structure)
+# ---------------------------------------------------------------------
+
+def sr_agent_node(state: State) -> State:
+    """Invoke the SR assistant model on the provided message list.
+
+    This mirrors esi_agent.agent: we construct/bind the chat model and invoke it
+    on state["messages"], then append the AI message back to the state's messages.
+    """
+    llm = init_chat_model(
+        model="gemini-2.5-flash",
+        model_provider="google_genai",
+    )
+    message = llm.invoke(state["messages"])
+    state["messages"].append(message)
+    return state
+
+
+def sr_tools_node(state: State) -> State:
+    """Placeholder tools node for SR agent.
+
+    Currently SR has no external tools exposed to the LLM. This mirrors the
+    tools node pattern so we can easily add tools later without changing the
+    graph wiring.
+    """
+    # No tools to run; simply return state unchanged
+    return state
+
+
+# Build a minimal graph: START -> agent
+sr_graph_builder = StateGraph(State)
+sr_graph_builder.add_node("agent", sr_agent_node)
+sr_graph_builder.add_edge(START, "agent")
+# No tools/conditional edges yet for SR
+sr_graph = sr_graph_builder.compile()
 
 async def main():
     """CLI for SR Agent runner (kickoff/chat/interactive)."""
