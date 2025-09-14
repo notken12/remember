@@ -579,6 +579,11 @@ def reschedule(state: Dict[str, Any], success: bool, now: Optional[datetime] = N
     questions = list(sess.get("questions", []))
     enqueue(state, clip_id=clip_id, questions=questions, interval_index=next_idx, base_time=now or datetime.utcnow(), attempt_count=attempt)
     sr["active_session"] = None
+    # Make stage explicit for idle/waiting state
+    try:
+        set_stage(state, "waiting")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------
@@ -863,8 +868,9 @@ class SRAgentRunner:
             now = datetime.utcnow()
             user_text_norm = (user_message or "").strip().lower()
             if get_stage(state) == "kickoff":
-                # Gate on readiness
-                if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"}:
+                # Gate on readiness (treat any substantive response as readiness too)
+                substantive = len(user_text.strip()) >= 2 and user_text_norm not in {"no", "not yet", "later"}
+                if user_text_norm in {"yes", "y", "ready", "begin", "start", "go", "yeah", "yup"} or substantive:
                     # Start earliest item now
                     q = sr.get("queue", []) or []
                     if q:
