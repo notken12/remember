@@ -19,7 +19,8 @@ from agent_state import State, get_state_from_supabase
 from parsing import parse_langgraph_stream
 from protocol import StreamProtocolPart
 import uuid
-from supabase import Client, create_client
+from supabase_client import supabase
+from chat.ChatSession import ChatSession
 
 from VideoClip import VideoClip
 
@@ -224,7 +225,7 @@ if not all([supabase_url, supabase_key, database_url]):
         "Required environment variables: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DATABASE_URL"
     )
 
-supabase: Client = create_client(supabase_url, supabase_key)
+# Use shared Supabase client imported above
 
 
 class MediaPart(TypedDict):
@@ -321,13 +322,32 @@ def _persist_messages_to_supabase(session_id: str, new_messages: List[Any]) -> N
                     logger.info("[DEBUG] Inserting message %d role=%s type=%s", idx, role, getattr(msg, "type", getattr(msg, "__class__", type(msg)).__class__.__name__ if hasattr(msg, "__class__") else "unknown"))
                 except Exception:
                     pass
-            supabase.table("chat_messages").insert(
-                {
-                    "role": role,
-                    "data": data_payload,
-                    "session_id": str(session_id),
-                }
-            ).execute()
+            try:
+                resp = (
+                    supabase.table("chat_messages")
+                    .insert(
+                        {
+                            "role": role,
+                            "data": data_payload,
+                            "session_id": str(session_id),
+                        }
+                    )
+                    .execute()
+                )
+                if logger:
+                    try:
+                        status = getattr(resp, "status_code", None)
+                        err = getattr(resp, "error", None) or getattr(resp, "message", None)
+                        logger.info("[DEBUG] Insert result status=%s error=%s", status, err)
+                    except Exception:
+                        pass
+            except Exception as e:
+                if logger:
+                    try:
+                        logger.info("[DEBUG] Insert exception: %s: %s", type(e).__name__, e)
+                    except Exception:
+                        pass
+                raise
     except Exception:
         # Non-fatal; continue
         try:
@@ -1055,6 +1075,15 @@ class SRAgentRunner:
             )
         except Exception:
             pass
+        # Ensure session record exists to satisfy RLS
+        try:
+            ChatSession(session_id=str(self.session_id)).save_to_supabase()
+            _initialize_logger().info("[DEBUG] Upserted chat session (session_id=%s)", self.session_id)
+        except Exception as e:
+            try:
+                _initialize_logger().info("[DEBUG] Failed to upsert chat session: %s: %s", type(e).__name__, e)
+            except Exception:
+                pass
         # Attach session id for logging context
         try:
             state["session_id"] = self.session_id
