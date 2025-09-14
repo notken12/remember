@@ -8,6 +8,7 @@ import redis
 from fastapi.middleware.cors import CORSMiddleware
 
 from esi_agent import chat, kickoff
+from AssistantAgent import AssistantAgent
 from protocol import FinishMessagePart, MessageStartPart
 
 # Connect to a Redis server running on localhost at the default port (6379)
@@ -50,6 +51,25 @@ async def esi_chat(session_id: str, user_message: str):
         yield ServerSentEvent(data=start_part)
 
         async for part in chat(session_id, user_message):
+            r.publish("web_stream", part.model_dump_json())
+            yield ServerSentEvent(data=part.model_dump_json())
+        finish_part = FinishMessagePart()
+        r.publish("web_stream", finish_part.model_dump_json())
+        yield ServerSentEvent(data=finish_part.model_dump_json())
+
+    return EventSourceResponse(generator())
+
+
+@app.post("/assistant_chat")
+async def assistant_chat(user_message: str):
+    assistant_agent = AssistantAgent()
+
+    async def generator():
+        start_part = MessageStartPart(messageId=str(uuid.uuid4())).model_dump_json()
+        r.publish("web_stream", start_part)
+        yield ServerSentEvent(data=start_part)
+
+        async for part in assistant_agent.query(user_message):
             r.publish("web_stream", part.model_dump_json())
             yield ServerSentEvent(data=part.model_dump_json())
         finish_part = FinishMessagePart()
