@@ -167,6 +167,53 @@ def _log_llm_prompt(state: Dict[str, Any], when: str = "before_invoke") -> None:
         # Never let logging crash the flow
         pass
 
+
+def _log_llm_response(state: Dict[str, Any], message: Any) -> None:
+    try:
+        logger = _initialize_logger()
+    except Exception:
+        return
+    try:
+        session_id = str(state.get("session_id", "unknown"))
+        try:
+            stage = get_stage(state)
+        except Exception:
+            stage = "unknown"
+        header = f"LLM Response | session_id={session_id} | stage={stage}"
+        logger.info(header)
+        payload = _serialize_message_for_log(message)
+        try:
+            logger.info("Response (sanitized):\n%s", json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception:
+            logger.info("Response (sanitized): [failed to serialize to JSON]")
+    except Exception:
+        pass
+
+
+def _log_sr_state_persisted(state: Dict[str, Any], context: str) -> None:
+    try:
+        logger = _initialize_logger()
+    except Exception:
+        return
+    try:
+        sr = ensure_sr_slice(state)
+        session_id = str(state.get("session_id", "unknown"))
+        stage = str(sr.get("stage", "idle"))
+        queue_len = len(sr.get("queue", []) or [])
+        selected_len = len(sr.get("selected_clips", []) or [])
+        enq_len = len(sr.get("enqueued_clips", []) or [])
+        logger.info(
+            "SR state persisted (%s) | session_id=%s | stage=%s | queue=%d | selected=%d | enqueued=%d",
+            context,
+            session_id,
+            stage,
+            queue_len,
+            selected_len,
+            enq_len,
+        )
+    except Exception:
+        pass
+
 # Validate environment variables (mirror esi_agent.py pattern)
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -1138,6 +1185,7 @@ class SRAgentRunner:
             marker_msg = _sr_slice_to_marker(sr_slice)
             state["messages"].append(marker_msg)
             _persist_messages_to_supabase(self.session_id, [marker_msg])
+            _log_sr_state_persisted(state, context="kickoff")
         except Exception:
             pass
 
@@ -1334,6 +1382,7 @@ class SRAgentRunner:
             marker_msg = _sr_slice_to_marker(sr_slice)
             state["messages"].append(marker_msg)
             _persist_messages_to_supabase(self.session_id, [marker_msg])
+            _log_sr_state_persisted(state, context="chat")
         except Exception:
             pass
 
@@ -1377,6 +1426,11 @@ def sr_agent_node(state: State) -> State:
     # Persist assistant reply for durable history
     try:
         _persist_messages_to_supabase(str(state.get("session_id", "")), [message])
+    except Exception:
+        pass
+    # Log the assistant response (sanitized)
+    try:
+        _log_llm_response(state, message)
     except Exception:
         pass
     return state
